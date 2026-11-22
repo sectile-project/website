@@ -1,0 +1,85 @@
+---
+title: "Chapter 01 — Why Sectile Exists"
+description: "Chapter 01 — Why Sectile Exists - part of the Sectile developer documentation."
+---
+
+Before touching a single line of Kotlin or Gradle configuration, it helps to understand **what problem Sectile was built to solve** and why its design looks different from older Minecraft or vanilla Hytale servers.
+
+---
+
+## What is Sectile?
+
+Sectile is an independent **Hytale server implementation and extensible plugin platform** written primarily in Kotlin (with Java interoperability) on the JVM.
+
+At its core, Sectile is not designed just to boot a server and open a port — it is designed from day one to act as a **long-lived modding and multiplayer platform** where dozens of plugins can be developed, loaded, reloaded, and maintained independently without corrupting server internals or breaking every time the engine evolves.
+
+---
+
+## The Problem Sectile Solves
+
+Most game servers start fast: add gameplay features, expose a plugin folder, ship builds to the community. Everything works well early on — until the server has to grow.
+
+Across ecosystems like **Spigot / CraftBukkit / Paper** in Minecraft and the default **Hytale** server runtime, the same structural bottlenecks repeat:
+
+### 1. Monoliths Without Boundaries ("Technical Debt Becomes Community Debt")
+
+When a server does not strictly separate **what is public API** from **how internal systems are implemented**, plugin developers naturally reach directly into internal classes to get their job done (just like Minecraft developers reaching for raw server internals — "NMS" — whenever the API falls short).
+
+Once community plugins depend on internal classes, concrete managers, and accidental behaviors:
+- Any deep optimization or engine rewrite breaks hundreds of plugins.
+- Technical debt becomes **community debt**: the core team gets trapped maintaining fragile internal compatibility instead of evolving the platform.
+- Over time, frustration causes ecosystem splits and competing hard forks (as happened with Spigot -> Paper -> Purpur/Leaf/Folia).
+
+Sectile prevents this at the architectural root: **internal implementation modules are not even visible on a plugin's runtime classpath**.
+
+### 2. The "God Object" Manager Anti-Pattern
+
+Using a "Manager" class is not inherently wrong — when a manager acts as a thin, single-purpose orchestrator, it works well. In many legacy game servers, however, classes like `PluginManager`, `CommandManager`, or `AssetManager` absorb **everything**:
+- File scanning, manifest parsing, dependency resolution, bytecode loading, enabling/disabling, error storage, and runtime lookups all crammed into a single 1,000+ line class.
+- Implicit global state everywhere, making code rigid, untestable, and full of hidden dependencies.
+
+Sectile breaks those monoliths into small, focused responsibilities:
+- Discovering JARs (`PluginScanner`)
+- Filtering & validating selection (`PluginInstaller`)
+- Computing dependency order (`PluginLoadGraphBuilder`)
+- Querying loaded plugins (`PluginCatalog`)
+- Controlling runtime state (`PluginLifecycleControl`)
+- Isolating each plugin's runtime resources (`PluginScope`)
+
+### 3. Broken Reloads & Implicit Concurrency Rules
+
+In older plugin APIs, a method signature hides critical questions:
+- *"If I register a listener or spawn a repeating task, what happens when my plugin reloads?"* -> In most servers, it leaks memory, leaves dead threads alive, or throws duplicate registration bugs.
+- *"When I call `runTaskLater(..., 20)`, is `20` ticks, milliseconds, or seconds? Does it run on the world thread or another thread?"* -> Without explicit contracts, developers have to decompile the server just to guess safely.
+
+Sectile makes ownership, time units, threading, and cleanup explicit in the API itself.
+
+---
+
+## Why Kotlin & the JVM? (The Platform Question)
+
+Sometimes developers ask: *"Why not write the server in Rust or C++ with native `.dll`/`.so` plugins or embedded Lua scripts?"*
+
+A server does **not** become a platform just because it supports plugins — it becomes a platform when extensions are **safe, portable, and cheap for thousands of developers to build and distribute**:
+
+| Approach | Strength | Platform Trade-off |
+| :--- | :--- | :--- |
+| **Native plugins (Rust/C++ `.dll`/`.so`)** | Maximum raw single-binary speed | Plugins require per-OS/per-CPU builds, lose compile-time safety across ABI boundaries, and crash the entire process on memory corruption. |
+| **Native Engine + Scripting (C++ + Lua/JS)** | Separates core performance from scripts | Forces maintaining two separate language worlds and toolchains; works best only when one company owns the entire closed editor & runtime. |
+| **JVM (Kotlin + Java `.jar` plugins)** | Write once, run on any OS in a single `.jar` | Bytecode verification, mature JIT optimization, Java Virtual Threads, zero ABI pain, and seamless interoperability between Java APIs and modern Kotlin DSLs. |
+
+For a community-driven modding ecosystem like Hytale, the **JVM + Kotlin** combination provides the strongest balance between runtime speed, single-file plugin portability, strict API boundaries, and developer ergonomics.
+
+---
+
+## Summary
+
+Sectile exists to provide:
+- A **small, stable core** rather than a tangled monolith.
+- **Physical separation** between public plugin contracts and private server internals.
+- **Automatic cleanup (`PluginScope`)** so hot-reloading plugins does not leak classes, listeners, commands, or threads.
+- A **complete SDK** on top of the API so plugin authors do not reinvent configs, command parsers, scanners, or cross-plugin bridges.
+
+---
+
+**Next Step:** [**Chapter 02 — Architecture From Zero**](/01-introduction/02-architecture-from-zero/) explains the difference between *architecture* and *folder structure*, and introduces Sectile's five main building blocks.

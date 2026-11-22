@@ -1,0 +1,112 @@
+---
+title: "Chapter 03 — API vs. Internals & Isolation"
+description: "Chapter 03 — API vs. Internals & Isolation - part of the Sectile developer documentation."
+---
+
+In Chapter 02, you learned about Sectile's five pillars (**Launcher**, **Kernel**, **Networking**, **Engine**, and **SDK**).
+
+If you put all classes of a pillar into one shared bucket, any plugin could reach into internal implementation details and break on future server updates. This chapter explains **how Sectile stops that from happening**, **which Gradle modules are public vs. internal**, and **how hot-reloading safely swaps plugin code at runtime**.
+
+---
+
+## Logical Sandboxing: Why Separate API from Internals?
+
+First, an honest clarification about what this isolation **is** and **is not**:
+
+- **It is NOT a security sandbox against OS-level malware.** All plugins still execute inside the same JVM process and share system memory and CPU. If you install an untrusted binary from the internet, JVM classloaders alone do not lock down the filesystem or network.
+- **It IS architectural encapsulation.** Its goal is to guarantee that well-meaning plugin developers build exclusively against Sectile's **public contracts** — never coupling accidentally to internal Netty codecs, storage maps, or server thread classes.
+
+When internal implementation code stays hidden behind the API boundary:
+- Core maintainers can refactor networking, swap storage engines, or optimize schedulers **without breaking plugins**.
+- Plugins stay clean, readable, and forward-compatible across server updates.
+
+---
+
+## Public vs. Internal Modules in Sectile
+
+Look at `gradle.properties` at the root of Sectile: every pillar you met in Chapter 02 is explicitly split into **Public API** modules (`publicProjectPaths`) and **Internal Implementation** modules (`internalProjectPaths`):
+
+| Pillar | Public API (Visible to Plugins — use as `compileOnly`) | Internal Implementation (Hidden at Runtime) |
+| :--- | :--- | :--- |
+| **Kernel** | `:kernel:api` (`Kernel`, events, services, scopes, schedulers, config, logger) | `:kernel:micro` (`Microkernel`, `PluginClassLoader`, `DefaultEventBus`, `DefaultServiceRegistry`) |
+| **Networking** | `:networking:api` (`PlayerConnection`, `NetworkConnector`, `ReadBuffer`/`WriteBuffer`, `StageHooks`) & `:networking:protocol` (packets & IDs) | `:networking:internal` (Netty QUIC server, Zstd compression, framing, JWT/auth, login pipeline) |
+| **Engine** | `:engine:api` (`Engine`, `Player`, `World`, `Command`, `BaseCommand`, `PermissionService`) & `:engine:chat` (`Message`, `Color`) | `:engine:internal`, `:engine:world`, `:engine:command` (mutable player state, world tick handlers, command tokenizer/parser) |
+| **SDK** | `:sdk:common` (`scope.*` extensions, command DSL, `PackageScanner` API) + `:sdk:gradle-extension:shared` (annotations) | `:sdk:bundled` (concrete YAML/JSON parsers, `DefaultPackageScanner`) |
+| **Launcher** | — *(plugins never depend on Launcher)* | `:launcher:isolated`, `:launcher:boostrap` |
+
+---
+
+## How Java `ClassLoader` Isolation Enforces This
+
+If you haven't worked with Java `ClassLoader`s before, think of a `ClassLoader` as **the dictionary responsible for loading compiled `.class` files into the JVM on demand**. Every class loaded by ClassLoader A is completely invisible to ClassLoader B unless A and B are linked in a parent/dependency relationship.
+
+When you boot Sectile via `IsolatedLauncher`, it constructs an intentional **three-tier ClassLoader tree**:
+
+```text
+                   JVM Platform ClassLoader
+                             │
+                             ▼
+               publicLoader ("publicClassLoader")
+          [contains ONLY publicProjectPaths:
+           :kernel:api, :networking:api, :networking:protocol,
+           :engine:api, :engine:chat, :sdk:common]
+                    /                    \
+                   ▼                      ▼
+       internalLoader               PluginClassLoader (Plugin A)
+   [Sectile core internals:         [Plugin A's staged JAR +
+    :kernel:micro, :engine:*,        Plugin A's @Bootstrap libs]
+    :networking:internal, etc.]            │
+                                           ▼ (only if declared in dependencies!)
+                                    PluginClassLoader (Plugin B)
+```
+
+Look closely at the arrows:
+- `internalLoader` has `publicLoader` as its parent, so the internal server can implement and return public API types cleanly.
+- Every plugin's `PluginClassLoader` **also** has `publicLoader` as its parent — **NOT `internalLoader`!**
+- Therefore, if a plugin tries to reference `dev.sectile.engine.internal.InternalPlayer` or Netty's internal QUIC classes, the JVM immediately throws `NoClassDefFoundError` — it cannot even see them.
+- Meanwhile, Plugin A can only see Plugin B's classes if Plugin A explicitly declares Plugin B under `dependencies` or `softDependencies`.
+
+### Exact Class Lookup Order in `PluginClassLoader`
+
+When code inside your plugin references a class name, `PluginClassLoader.loadClass(...)` checks in this exact order:
+
+1. **Already loaded cache (`findLoadedClass`)**: Reuses the class if this plugin already loaded it.
+2. **Public parent (`publicClassLoader`)**: Checks JDK, Kotlin stdlib, and Sectile's public API modules first. *(This ensures plugins can never accidentally shadow or fork core API types like `Player` or `PluginScope`.)*
+3. **Declared dependencies (`dependencies` / `softDependencies`)**: Checks linked dependency `PluginClassLoader`s (with cycle protection).
+4. **Own plugin JAR + `@Bootstrap` libraries (`findClass`)**: Resolves your own classes and any third-party Maven libraries downloaded during your `@Bootstrap` phase.
+
+---
+
+## Capability Separation: Read Globally, Mutate Through Your Scope
+
+Enforcing ClassLoader visibility stops plugins from touching internal classes — but what stops a plugin from registering a listener directly onto a global singleton and forgetting to remove it on unload?
+
+Sectile solves that with **Capability Separation**:
+
+- **Global entry points (`Kernel.bus`, `Kernel.services`, `Engine.commands`, `Engine.worlds`)** only expose **read or dispatch** interfaces (`EventDispatcher`, `ServiceCatalog`, `CommandDispatcher`, `WorldCatalog`).
+- **Registration and mutation** (`EventBus`, `ServiceRegistry`, `CommandRegistry`, `WorldRegistry`, `PacketHandlerRegistry`, `StageHookRegistry`) can **only** be acquired from your plugin's own **`PluginScope`**.
+
+For example:
+- You can *fire* an event anywhere via `Kernel.bus.publish(myEvent)`.
+- You can only *subscribe* to events via `scope.eventbus().subscribe(...)`. Because your `PluginScope` owns that subscription, Sectile knows **who** registered it and removes it automatically when your plugin reloads!
+
+---
+
+## How Hot-Reload & Windows JAR Staging Work
+
+Two technical problems make hot-reloading `.jar` files notoriously painful on the JVM — especially on Windows:
+
+1. **Windows File Locking**: When Java opens a `.jar` directly via `URLClassLoader`, the OS locks that file on disk so you cannot overwrite `plugins/my-plugin.jar` with a new build while the server is running.
+2. **Stale `JarURLConnection` Caches**: By default, the JDK caches zip central directories in memory by `jar:` URL, returning stale class lists after a file changes.
+
+Sectile fixes both cleanly:
+- **Temporary JAR Staging (`PluginInstanceCreator.stageJar`)**: Before loading a plugin, Sectile copies `plugins/my-plugin.jar` into a temporary file (`sectile-plugin-<id>-<unique>.jar`) and points `PluginClassLoader` at the staged copy — leaving your original file in `/plugins/` completely unlocked! When the plugin disables, `PluginClassLoader.close()` deletes the staged copy.
+- **Cache-Disabled Bytecode Scanning**: `DefaultPackageScanner` explicitly sets `connection.useCaches = false` whenever reading `.jar` entries.
+- **Cascading Reloads (`/plugins reload my-plugin`)**: If Plugin B depends on Plugin A (via required `dependencies` OR loaded `softDependencies`), Sectile automatically computes the dependency graph:
+  1. Disables dependents first (`B`, then `A`) in reverse topological order (calling `onDisable()`, closing each `PluginScope`, and closing each `PluginClassLoader`).
+  2. Re-scans `A`'s latest JAR from disk.
+  3. Loads and enables `A` cleanly, then loads and enables `B` against `A`'s brand-new `PluginClassLoader`.
+
+---
+
+**Next Step:** Now that you understand Sectile's blueprint and isolation model, let's build something real in [**Chapter 04 — Your First Plugin**](/02-plugin-fundamentals/04-your-first-plugin/).

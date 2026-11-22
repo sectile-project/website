@@ -1,0 +1,221 @@
+---
+title: "Chapter 12 — Inside the Hytale Protocol (QUIC & Packets)"
+description: "Chapter 12 — Inside the Hytale Protocol (QUIC & Packets) - part of the Sectile developer documentation."
+---
+
+In the final chapter of this guide, we move down to the wire layer: **why Hytale runs on QUIC instead of TCP**, **how Sectile frames, secures, and compresses packets**, **how Hytale's binary buffer layout works**, and **how to send or handle gameplay packets cleanly inside a plugin**.
+
+---
+
+## Why Hytale Uses QUIC Over UDP
+
+Older block games (like Minecraft Java Edition) run over a single **TCP** connection. TCP guarantees reliable, in-order delivery across the whole socket — which sounds nice until one single packet containing chunk terrain drops on the internet:
+- TCP freezes **every** packet behind that lost chunk — meaning **player chat, combat hits, health updates, and movement stall together** (called **Head-of-Line Blocking**).
+
+**QUIC** runs over **UDP** with built-in TLS 1.3 encryption and independent **multiplexed streams** inside a single connection:
+- Chunk streaming uses one stream; low-latency gameplay/movement uses another; world map updates use a third.
+- If a UDP datagram carrying terrain chunks drops and needs retransmission, **only that chunk stream waits** — combat, movement, and chat keep flowing smoothly!
+
+---
+
+## Logical Streams (`NetworkChannel`)
+
+Sectile exposes Hytale's four logical stream channels through `dev.sectile.network.api.NetworkChannel`:
+
+| Channel | Direction & Type | Stream ID | Priority | Used For |
+| :--- | :--- | :--- | :--- | :--- |
+| `NetworkChannel.DEFAULT` | Client-opened Bidirectional | Stream `0` | Urgency `0`, non-incremental | Login, auth, chat, movement, combat, entities, commands, inventory, UI. |
+| `NetworkChannel.CHUNKS` | Server-opened Unidirectional | Stream `3` | Urgency `0`, incremental | `SetChunk`, `SetColumn`, `UnloadChunk`, `ServerSetBlock(s)`, `ViewRadius`, fluids. |
+| `NetworkChannel.WORLD_MAP` | Server-opened Unidirectional | Stream `7` | Urgency `1` (lower priority), incremental | `UpdateWorldMap`, `ClearWorldMap` (never starves gameplay chunks!). |
+| `NetworkChannel.VOICE` | Client-opened Auxiliary Bidi | Bidi (`id & 0x3 == 0`) | 5s handshake (`StreamOpen`) | `VoiceData` and `RelayedVoiceData`. |
+
+When `PlayerConnection.sendPacket(packet)` is called, **`NettyPlayerConnection` routes the packet to the matching QUIC stream automatically** using `packet.definition.channel`. When sending batches via `sendPackets(...)`, Netty flushes **once per stream touched** to minimize kernel syscalls.
+
+---
+
+## Transport Security, ALPN & Rate Limits (`QuicTransport`)
+
+When `QuicTransport` binds UDP (`5520` by default in `network.yaml`) using `netty-incubator-codec-quic`:
+
+1. **No-Retry Handshake & BBR Congestion Control**: Uses `NoQuicTokenHandler.INSTANCE`, `earlyData(false)` (disabling non-forward-secret 0-RTT replay surface), PMTU discovery, and `QuicCongestionControlAlgorithm.BBR`, with a `32 MiB` UDP socket receive buffer (`SO_RCVBUF`).
+2. **ALPN Version Negotiation (`hytale/3`)**: Advertises `hytale/<PROTOCOL_VERSION>` and `hytale/<PROTOCOL_VERSION - 1>`. Accepting the previous protocol version at the TLS level lets Sectile send a friendly `ServerDisconnectPacket("client.general.disconnect.clientOutdated")` before closing!
+3. **Mutual TLS Certificate Pinning (`ClientAuth.REQUIRE`)**: Every client must present an X.509 certificate during the QUIC TLS handshake. `QuicConnectionHandler` attaches it to `player.connection.clientCertificate`, and authenticated mode validates that the Hytale Session Service JWT (`cnf.x5t#S256`) matches the SHA-256 certificate fingerprint.
+4. **Shared Rate Limiter (`TokenBucket`)**: Each `QuicChannel` creates one token bucket shared across all QUIC streams on that connection (`rate-limit` in `network.yaml`) so a flood on an auxiliary stream cannot bypass limits.
+
+---
+
+## Packet Framing & Zstd Compression
+
+Every packet written on any Hytale QUIC stream uses an 8-byte little-endian header:
+
+```text
++-------------------------------+-------------------------------+--------------------------------+
+|  payloadLength (uint32 LE)    |    packetId (uint32 LE)       |  payload bytes (raw or Zstd)   |
+|          4 bytes              |           4 bytes             |     payloadLength bytes        |
++-------------------------------+-------------------------------+--------------------------------+
+```
+
+### How `PacketDecoder` Guards Against Malicious Traffic
+
+Before decompressing a single byte, `PacketDecoder` validates inbound frames in strict fail-fast order:
+
+1. Wait until all 8 header bytes arrive.
+2. Reject negative lengths or lengths exceeding `QuicProtocol.MAX_PACKET_SIZE` (`1,677,721,600`).
+3. Look up `packetId` in `PacketRegistry.getToServer(packetId)` — reject unknown/outbound-only IDs immediately.
+4. Check `payloadLength <= definition.maxSize` (e.g., `Connect` max `38,056` bytes; `ClientMovement` max `117` bytes).
+5. Verify the packet arrived on the stream matching `definition.channel`.
+6. Check active stage strictness (`strict = true` stages immediately close on unexpected IDs).
+7. Wait for all `payloadLength` bytes before draining a `TokenBucket` rate-limit token.
+8. **Zero-copy skip**: In non-strict stages (`POST_LOGIN`), if nobody registered a handler for an optional packet, `PacketDecoder` skips `payloadLength` bytes without allocating or running Zstd!
+9. Decompress Zstd (`PacketCompression`) **only after verifying `Zstd.getFrameContentSize` fits within `definition.maxSize`** (stopping zip-bomb attacks), using direct zero-copy `nioBuffer` paths whenever available.
+10. Refresh idle read timeout **only after a complete packet decodes** (blocking trickle-byte Slowloris attacks).
+
+### Zero-Copy Broadcasts (`PacketsSender` & `CachedPacket`)
+
+When broadcasting the same outbound packet to multiple connected players, calling `player.connection.sendPacket(pkt)` in a loop serializes and Zstd-compresses the frame repeatedly per player.
+
+Instead, use **`NetworkConnector.packetsSender`**:
+
+```kotlin
+val recipients = Engine.players.all().map { it.connection }
+NetworkConnector.packetsSender.sendPacket(recipients, MyWorldUpdatePacket(...))
+```
+
+`PacketSenderInternal` / `CachedPacket` encodes and compresses the packet **once** into a reference-counted Netty `ByteBuf` (`ttl = recipients.size`), retains lightweight duplicates per target connection, and automatically releases the buffer when the final write future completes!
+
+---
+
+## Hytale's Binary Packet Layout (`ReadBuffer`, `WriteBuffer` & `ProtocolPacketTable`)
+
+All packet metadata lives in **`ProtocolPacketTable`** (`dev.sectile.network.protocol`), defining packet IDs from `0` (`Connect`) to `527` (`DismissServersidePage`) (`ProtocolSettings.PACKET_COUNT = 389`, `PROTOCOL_BUILD_NUMBER = 258`, `PROTOCOL_CRC = 3908406161L`).
+
+Every `InboundPacket` reads via **`ReadBuffer`**, and every `OutboundPacket` writes via **`WriteBuffer`**:
+
+### Primitive Encoding Rules
+- **Numeric scalars** (`Short`, `Int`, `Long`, `Float`, `Double`): **Little-endian**.
+- **UUIDs** (`readUUID`, `writeUUID`): **RFC 4122 big-endian** (network byte order).
+- **VarInts** (`readVarInt`, `writeVarInt`, `DataSize.varInt`): Canonical unsigned 7-bit little-endian groups (max 5 bytes).
+- **Strings & Arrays**: VarInt-length-prefixed UTF-8/ASCII (`readVarString`, `readVarAsciiString`, `readVarByteArray`), validated against explicit field limits, plus fixed-width padded ASCII (`readFixedAscii`).
+
+### The Three-Region Packet Structure (Fixed + Offset Table + Variable)
+
+To allow O(1) jumping to optional or variable fields without parsing everything sequentially when unused, Hytale packets encode variable fields in three strict regions:
+
+```text
+Offset from packet start (`base`):
++-------------------------------------------------------------------+
+| 1. Fixed Block      Nullability bitmask (`nullBits`) + scalars    |
++-------------------------------------------------------------------+
+| 2. Offset Slots     4-byte uint32 LE slots (relative to varStart) |
+|                     -> byte offset if present, or -1 if null      |
++-------------------------------------------------------------------+
+| 3. Variable Block   Sequential payloads (strings, nested structs) |
++-------------------------------------------------------------------+
+```
+
+Sectile validates that random-access offset slots and sequential reads **always agree** via `ReadBuffer.readSlot(...)` and `requireSlot(...)` (see `ConnectPacket` in `networking/protocol`):
+
+```kotlin
+override fun read(buf: ReadBuffer) {
+    val base = buf.index
+    val nullBits = buf.readUnsignedByte()           // presence flags
+    protocolCrc = buf.readInt()                     // fixed 4B LE
+    protocolBuildNumber = buf.readInt()             // fixed 4B LE
+    clientVersion = buf.readFixedAscii(20)          // fixed 20B
+    val clientTypeOrdinal = buf.readUnsignedByte()  // fixed 1B
+    clientType = ClientType.of(clientTypeOrdinal)
+        ?: throw ProtocolFormatException("Invalid enum value 'ClientType': $clientTypeOrdinal")
+
+    val varBlockStart = base + VARIABLE_BLOCK_START // 30B fixed + 4*4B offset slots = 46
+    buf.skipTo(varBlockStart)
+
+    identityToken = buf.readSlot(base + 30, varBlockStart, nullBits and 0x01 != 0, "IdentityToken") {
+        buf.readVarString(MAX_IDENTITY_TOKEN_LENGTH, "IdentityToken")
+    }
+    buf.requireSlot(base + 34, buf.index - varBlockStart, "Language")
+    language = buf.readVarAsciiString(MAX_LANGUAGE_LENGTH, "Language")
+    // ...
+}
+```
+
+When writing custom outbound packets, pair `WriteBuffer.reserveOffset()` and `WriteBuffer.writeSlot(...)` with accurate byte sizing in `size(): Int` using `DataSize` so Netty allocates the exact buffer size upfront.
+
+---
+
+## Listening to & Sending Gameplay Packets in Your Plugin
+
+During active gameplay (`ConnectionStage.POST_LOGIN`), plugins can register packet handlers safely via **`scope.packetHandlers()`**:
+
+### Listening to a Typed `InboundPacket` (`on`)
+
+```kotlin
+import dev.sectile.kernel.logger.logger
+import dev.sectile.kernel.plugin.spi.lifecycle.BasePluginLifecycle
+import dev.sectile.network.api.packet.handler.on
+import dev.sectile.network.protocol.ProtocolPacketTable
+import dev.sectile.network.protocol.chat.inbound.ChatMessagePacket
+import dev.sectile.sdk.extension.packetHandlers
+import dev.sectile.sdk.extension.scope
+import dev.sectile.sdk.plugin.annotation.Plugin
+
+@Plugin(id = "packet-spy", version = "1.0.0")
+class PacketSpyPlugin : BasePluginLifecycle() {
+
+    override fun enable() {
+        val handler = scope.packetHandlers().on(
+            ProtocolPacketTable.CHAT_MESSAGE,
+            ::ChatMessagePacket,
+        ) { connection, packet ->
+            logger().info("${connection.session.username} sent chat: ${packet.message}")
+        }
+
+        // Automatically removed when this plugin disables or reloads!
+        // You can also remove early via `scope.packetHandlers().remove(handler)`.
+    }
+}
+```
+
+### Reading Directly From `ReadBuffer` (`handle`)
+
+For lightweight inspection or packets where you want to parse fields manually using `ProtocolPacketTable`:
+
+```kotlin
+import dev.sectile.network.api.packet.handler.handle
+import dev.sectile.network.protocol.ProtocolPacketTable
+import dev.sectile.sdk.extension.packetHandlers
+import dev.sectile.sdk.extension.scope
+
+scope.packetHandlers().handle(ProtocolPacketTable.PLAY_EMOTE) { connection, buffer ->
+    // Decode payload bytes safely with `buffer` (little-endian / VarInt / slots)
+}
+```
+
+### Sending Packets to Players
+
+```kotlin
+import dev.sectile.engine.api.Engine
+import dev.sectile.network.api.NetworkConnector
+import dev.sectile.network.protocol.world.outbound.UpdateWeatherPacket
+
+// Single player (automatically sent on the packet's declared NetworkChannel stream):
+player.connection.sendPacket(UpdateWeatherPacket(weatherIndex = 0, transitionSeconds = 3.0f))
+
+// Broadcast to everyone online (single serialization & Zstd pass):
+val connections = Engine.players.all().map { it.connection }
+NetworkConnector.packetsSender.sendPacket(
+    connections,
+    UpdateWeatherPacket(weatherIndex = 1, transitionSeconds = 5.0f),
+)
+```
+
+---
+
+## Congratulations!
+
+You have reached the end of the Sectile linear guide:
+- You started with *why* Sectile separates a tiny microkernel, clear SDK, and isolated `PluginClassLoader` tiers.
+- You learned how `@Plugin`, `@Bootstrap`, `ConfigSection`, `PluginScope`, and `PackageScanner` keep plugins modular, readable, and leak-free across `/plugins reload`.
+- You saw how events, cross-plugin services (`PermissionService`, `ServiceCatalog`), commands, rich chat, worlds, virtual threads, and deterministic schedulers work together cleanly.
+- And you traced packets all the way down to Hytale's QUIC streams, login stage machine (`StepDecision.Hold`), framing, and Zstd binary layout.
+
+Return to the [**Documentation Index**](/) whenever you want to jump back to any chapter as a reference.

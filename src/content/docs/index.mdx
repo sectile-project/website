@@ -1,0 +1,106 @@
+---
+title: "Sectile Documentation"
+description: "Official developer documentation for Sectile: architecture, networking and plugin development."
+template: splash
+---
+
+<div className="sectile-home">
+  <section className="sectile-hero">
+    <div className="sectile-hero__copy">
+      <h1>Sectile Docs</h1>
+      <p className="sectile-docs__subtitle">Everything you need to know about Sectile's architecture and plugin development.</p>
+    </div>
+
+    <div className="sectile-hero__art">
+      <img className="sectile-hero__logo sectile-hero__logo--dark" src="/sectile-logo-dark.svg" alt="The Sectile mark in lime, blue and white" width="514" height="382" />
+      <img className="sectile-hero__logo sectile-hero__logo--light" src="/sectile-logo-light.svg" alt="The Sectile mark in lime, blue and black" width="428" height="318" />
+    </div>
+  </section>
+
+  <section className="sectile-docs">
+
+    <div className="sectile-part">
+      <h3>Part 1 · Introduction</h3>
+      <div className="sectile-card-grid">
+        <a className="sectile-card" href="/01-introduction/01-why-sectile/">
+          <span className="sectile-card__index">CHAPTER 01</span>
+          <h4>Why Sectile Exists</h4>
+          <p>Why monolithic servers and forks break down, and the principles behind Sectile.</p>
+        </a>
+        <a className="sectile-card" href="/01-introduction/02-architecture-from-zero/">
+          <span className="sectile-card__index">CHAPTER 02</span>
+          <h4>Architecture From Zero</h4>
+          <p>The five layers of Sectile: Launcher, Kernel, Networking, Engine and SDK.</p>
+        </a>
+        <a className="sectile-card" href="/01-introduction/03-api-vs-internals-and-isolation/">
+          <span className="sectile-card__index">CHAPTER 03</span>
+          <h4>API vs. Internals &amp; Isolation</h4>
+          <p>Public contracts, internal code, capability separation and safe hot-reload.</p>
+        </a>
+      </div>
+    </div>
+
+    <div className="sectile-part">
+      <h3>Part 2 · Plugin Fundamentals</h3>
+      <div className="sectile-card-grid">
+        <a className="sectile-card" href="/02-plugin-fundamentals/04-your-first-plugin/">
+          <span className="sectile-card__index">CHAPTER 04</span>
+          <h4>Your First Plugin</h4>
+          <p>Gradle setup, annotations, lifecycle, bootstrap libraries and configuration.</p>
+        </a>
+        <a className="sectile-card" href="/02-plugin-fundamentals/05-plugin-scopes-and-memory-safety/">
+          <span className="sectile-card__index">CHAPTER 05</span>
+          <h4>PluginScope &amp; Memory Safety</h4>
+          <p>Automatic cleanup, third-party wrappers and avoiding classloader leaks.</p>
+        </a>
+        <a className="sectile-card" href="/02-plugin-fundamentals/06-package-scanner-and-di/">
+          <span className="sectile-card__index">CHAPTER 06</span>
+          <h4>Package Scanner &amp; DI</h4>
+          <p>Zero-boilerplate registration and constructor injection with scope.scan.</p>
+        </a>
+      </div>
+    </div>
+
+    <div className="sectile-part">
+      <h3>Part 3 · Building Gameplay</h3>
+      <div className="sectile-card-grid">
+        <a className="sectile-card" href="/03-building-gameplay/07-events-and-phases/">
+          <span className="sectile-card__index">CHAPTER 07</span>
+          <h4>Events &amp; Execution Phases</h4>
+          <p>EventBus, listener priorities, cancellation and custom events.</p>
+        </a>
+        <a className="sectile-card" href="/03-building-gameplay/08-cross-plugin-services/">
+          <span className="sectile-card__index">CHAPTER 08</span>
+          <h4>Cross-Plugin Services</h4>
+          <p>Sharing capabilities safely through ServiceRegistry and ServiceCatalog.</p>
+        </a>
+        <a className="sectile-card" href="/03-building-gameplay/09-commands-chat-and-worlds/">
+          <span className="sectile-card__index">CHAPTER 09</span>
+          <h4>Commands, Chat &amp; Worlds</h4>
+          <p>Typed commands, rich formatted messages and multi-world interactions.</p>
+        </a>
+        <a className="sectile-card" href="/03-building-gameplay/10-concurrency-and-schedulers/">
+          <span className="sectile-card__index">CHAPTER 10</span>
+          <h4>Concurrency &amp; Schedulers</h4>
+          <p>Virtual threads, bounded pools and deterministic tick schedulers.</p>
+        </a>
+      </div>
+    </div>
+
+    <div className="sectile-part">
+      <h3>Part 4 · Networking &amp; Protocol</h3>
+      <div className="sectile-card-grid">
+        <a className="sectile-card" href="/04-networking-and-protocol/11-login-and-connection-stages/">
+          <span className="sectile-card__index">CHAPTER 11</span>
+          <h4>Login &amp; Connection Stages</h4>
+          <p>Handshake to spawn, stage hooks and async hold/resume steps.</p>
+        </a>
+        <a className="sectile-card" href="/04-networking-and-protocol/12-hytale-protocol-quic-and-packets/">
+          <span className="sectile-card__index">CHAPTER 12</span>
+          <h4>Inside the Hytale Protocol</h4>
+          <p>QUIC, streams, framing, Zstd compression and binary packet layout.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+</div>

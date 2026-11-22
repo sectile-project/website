@@ -1,0 +1,168 @@
+---
+title: "Chapter 07 — Events & Execution Phases"
+description: "Chapter 07 — Events & Execution Phases - part of the Sectile developer documentation."
+---
+
+Now that you know how plugins are created, scoped, and discovered, let's build actual gameplay interactions. The first tool in every modular plugin platform is the **Event System**.
+
+---
+
+## Why Does an Event Bus Exist?
+
+Suppose Plugin A implements a PvP arena, Plugin B implements anti-cheat checks, and Plugin C logs chat and combat analytics. Without an event bus, every action would either:
+- Hardcode direct dependencies on dozens of other plugins, or
+- Force you to subclass huge internal classes just to react when a block is clicked or a player speaks.
+
+An **Event Bus** decouples **who fires an action** from **who reacts to it**. One system publishes an event object (`Kernel.bus.publish(event)`); any number of independent plugins listen, validate, cancel, modify, or record it through clean `@Listener` methods or Kotlin lambdas.
+
+### Why `EventDispatcher` Is Separated From `EventBus`
+
+Remember Sectile's capability separation from Chapter 03:
+- **`Kernel.bus` (`EventDispatcher`)**: Exposed globally so *anyone* can call `Kernel.bus.publish(event)` to emit an event.
+- **`scope.eventbus()` (`EventBus`)**: Only accessible through your **`PluginScope`** so *every* listener registration belongs to your plugin and unsubscribes automatically when your plugin reloads.
+
+---
+
+## The Basics: Two Ways to Listen for Events
+
+Notice something refreshing in Sectile: **events do not need to extend any heavy base `Event` class**. Any Kotlin `data class`, `class`, or `String` can be published directly as an event!
+
+### Option A: Functional Subscriptions (`subscribe<T>`)
+
+Best for quick hooks or lambdas directly inside `enable()`:
+
+```kotlin
+import dev.sectile.kernel.Kernel
+import dev.sectile.kernel.event.subscribe
+import dev.sectile.kernel.logger.logger
+import dev.sectile.sdk.extension.eventbus
+import dev.sectile.sdk.extension.scope
+
+data class PlayerGreetEvent(val username: String)
+
+override fun enable() {
+    val bus = scope.eventbus()
+
+    val subscription = bus.subscribe<PlayerGreetEvent> { event ->
+        logger().info("Received greeting for ${event.username}")
+    }
+
+    // Fire the event anywhere:
+    Kernel.bus.publish(PlayerGreetEvent("Alice"))
+
+    // Optional early cleanup (otherwise unsubscribed automatically on disable/reload):
+    // bus.unsubscribe(subscription)
+}
+```
+
+### Option B: Annotated Listener Methods (`@Listener`)
+
+For larger features, organize handlers into clean listener classes annotated with `@Listener`:
+
+```kotlin
+package com.example.myplugin.listeners
+
+import dev.sectile.kernel.event.Listener
+import dev.sectile.kernel.event.handler.ListenerPhase
+import dev.sectile.kernel.logger.logger
+import dev.sectile.kernel.plugin.spi.lifecycle.PluginLifecycle
+
+class CombatLogListener(
+    private val plugin: PluginLifecycle,
+) {
+
+    @Listener
+    fun onGreet(event: PlayerGreetEvent) {
+        plugin.logger().info("Annotated listener saw: ${event.username}")
+    }
+}
+```
+
+You can register this object manually with `scope.eventbus().subscribe(CombatLogListener(this))` or discover the whole `.listeners` package automatically using `scope.scan { listeners() }` (Chapter 06).
+
+---
+
+## Controlling Order: `ListenerPhase` & `priority`
+
+What happens if Plugin A checks permissions, Plugin B transforms text colors, and Plugin C logs chat? Without an explicit ordering contract, whichever plugin happened to load first wins by accident.
+
+Sectile solves this cleanly in two dimensions: **Phase** (coarse lifecycle stage) and **Priority** (fine ordering inside that stage).
+
+### 1. The 6 Chronological Phases (`ListenerPhase`)
+
+Listeners always execute strictly from earliest phase to latest phase:
+
+```text
+INITIAL ──▶ EARLY ──▶ DEFAULT ──▶ LATE ──▶ FINAL ──▶ MONITOR
+```
+
+| Phase | Intended Role | May Cancel / Mutate? |
+| :--- | :--- | :--- |
+| `INITIAL` | Earliest setup/preparation before normal game logic runs. | Yes |
+| `EARLY` | Security guards, anti-cheat, mute/permission checks, or global vetoes. | Yes |
+| `DEFAULT` | Standard plugin behavior (used when `phase` is omitted). | Yes |
+| `LATE` | Adjustments reacting to modifications made in `DEFAULT`. | Yes |
+| `FINAL` | Last chance to override cancellation or finalize outcomes. | Yes |
+| `MONITOR` | Read-only logging, metrics, webhooks, and analytics **after the final outcome is decided**. | **Never mutate or cancel here!** |
+
+### 2. Numeric `priority` Within the Same Phase
+
+Inside any single `ListenerPhase`, listeners run in **descending numerical order of `priority`**:
+- **Higher `priority` runs BEFORE lower `priority`** (e.g., `priority = 255` executes before `priority = 1`, which executes before `priority = 0`).
+- Default priority is `0`.
+
+```kotlin
+@Listener(phase = ListenerPhase.EARLY, priority = 100)
+fun checkMuteFirst(event: ChatAttemptEvent) {
+    // Runs in EARLY before default priority (0) listeners!
+}
+
+@Listener(phase = ListenerPhase.MONITOR, ignoreCancelled = true)
+fun auditChatResult(event: ChatAttemptEvent) {
+    // Runs last, even if someone in EARLY/DEFAULT cancelled the event.
+}
+```
+
+---
+
+## Cancelling Events (`Cancellable` & `ignoreCancelled`)
+
+When an action can be prevented by plugins (e.g., blocking chat, denying teleports, stopping damage), implement `dev.sectile.kernel.event.Cancellable`:
+
+```kotlin
+import dev.sectile.kernel.event.Cancellable
+
+data class TeleportAttemptEvent(
+    val playerName: String,
+    val destinationWorld: String,
+    override var cancelled: Boolean = false,
+) : Cancellable
+```
+
+Here is how `cancelled` interacts with `ignoreCancelled` (default `false`):
+1. A listener in `EARLY` sets `event.cancelled = true`.
+2. Subsequent listeners with `ignoreCancelled = false` (the default) are **skipped automatically** — avoiding wasted work!
+3. Listeners explicitly declaring `ignoreCancelled = true` (such as a `FINAL` un-canceller or a `MONITOR` audit logger) **still run**.
+
+Publishing and checking a cancellable event looks like this:
+
+```kotlin
+val event = TeleportAttemptEvent(player.username, "arena")
+Kernel.bus.publish(event)
+
+if (!event.cancelled) {
+    // Perform the teleport!
+}
+```
+
+---
+
+## Under the Hood (`DefaultEventBus`)
+
+- **MethodHandle dispatch**: Annotated `@Listener` methods are compiled to `MethodHandle`-backed executors at registration time rather than slow repeated reflection invocations per event.
+- **Exact-type dispatch**: `DefaultEventBus.publish(event)` looks up `event.javaClass` directly in a concurrent `EventStorage` map with zero event hierarchy scanning overhead.
+- **Automatic cleanup + TCCL**: `ScopedEventBusProvider` keeps a set of every `Subscription` created through `scope.eventbus()`, wraps execution with your `PluginClassLoader` as Thread Context ClassLoader (`TCCL`), and calls `unsubscribe()` on every subscription automatically when your plugin reloads.
+
+---
+
+**Next Step:** Events react to things happening *right now*. When one plugin exposes reusable *capabilities or APIs* for other plugins to query (like permissions or economy), you need [**Chapter 08 — Cross-Plugin Services**](/03-building-gameplay/08-cross-plugin-services/).

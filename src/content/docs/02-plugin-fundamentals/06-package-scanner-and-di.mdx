@@ -1,0 +1,177 @@
+---
+title: "Chapter 06 — Package Scanner & Dependency Injection"
+description: "Chapter 06 — Package Scanner & Dependency Injection - part of the Sectile developer documentation."
+---
+
+As your plugin grows, registering dozens of command classes and event listener classes manually inside `enable()` quickly turns into a wall of repetitive boilerplate.
+
+Sectile includes a lightweight **Package Scanner & Constructor Dependency Injector** (`scope.scan { ... }`) in `:sdk:common` / `:sdk:bundled` that keeps your `enable()` method clean and declarative — without needing massive reflection frameworks like Spring or Guice.
+
+---
+
+## Why Use `PackageScanner`?
+
+- **Zero boilerplate**: Add a new command in `.commands` or a new listener in `.listeners` and it is discovered automatically — you don't have to remember to edit `enable()` every time you add a file.
+- **Explicit, predictable DI**: Constructor dependencies are passed explicitly through `provide(...)`, with zero hidden static singletons or field-injection magic.
+- **Reload-safe & fast**: `DefaultPackageScanner` filters classes by target interface *before* instantiating anything, disables `JarURLConnection` caching on `.jar` URLs, and delegates every discovered instance into your `PluginScope`.
+
+---
+
+## Basic Usage: Conventions (`listeners()` & `commands()`)
+
+By default, `ScannerProvider` inspects your `@Plugin` main class package (`defaultPackage`, e.g., `com.example.myplugin`) and provides two zero-config conventions:
+- `listeners()` scans `<defaultPackage>.listeners` and registers matching classes onto `scope.eventbus()`.
+- `commands()` scans `<defaultPackage>.commands` and registers `Command` / `BaseCommand` subclasses onto `scope.commands()`.
+
+```kotlin
+package com.example.myplugin
+
+import dev.sectile.kernel.logger.logger
+import dev.sectile.kernel.plugin.spi.lifecycle.BasePluginLifecycle
+import dev.sectile.sdk.extension.scan
+import dev.sectile.sdk.extension.scope
+import dev.sectile.sdk.plugin.annotation.Plugin
+
+@Plugin(id = "my-plugin", version = "1.0.0")
+class MyPlugin : BasePluginLifecycle() {
+
+    override fun enable() {
+        val config = loadMyConfig()
+        val database = MyDatabase()
+        scope.onClose(database)
+
+        val result = scope.scan {
+            // Expose objects that listeners and commands can request in their constructors:
+            provide(scope, config)
+            provideWithHierarchy(this@MyPlugin, database)
+
+            // Discover classes in com.example.myplugin.listeners & .commands:
+            listeners()
+            commands()
+        }
+
+        logger().info("Scanner registered ${result.amountClasses()} components.")
+    }
+}
+```
+
+### Explicit Package Lists
+
+If your project organizes features by domain instead of flat `.listeners` / `.commands` packages, pass one or more explicit package names:
+
+```kotlin
+scope.scan {
+    provide(scope, config)
+    listeners("com.example.myplugin.chat", "com.example.myplugin.protection")
+    commands("com.example.myplugin.admin.commands")
+}
+```
+
+---
+
+## How Constructor Dependency Injection Works
+
+When `DefaultPackageScanner` discovers a candidate class inside a scanned package, `DependencyInjector` instantiates it cleanly:
+
+### Resolution Rules
+
+1. **Kotlin `object` Singletons**: If the discovered class is a Kotlin `object` (has a matching static `INSTANCE` field), the scanner reuses `INSTANCE` directly without calling any constructor.
+2. **Regular Classes**:
+   - All declared constructors are sorted in **descending order by parameter count**.
+   - The scanner selects the **largest constructor whose every parameter type exists** in your provided instances (`provide`, `provideAs`, `provideWithHierarchy`).
+   - Lookup uses **exact `Class<*>` equality** — no guessing or runtime magic proxies.
+   - No field injection or setter injection is performed.
+3. **Skipped Types**: Interfaces, annotations, enums, abstract classes, synthetic/anonymous/local classes, and compiler-generated `$` nested synthetic classes are automatically skipped.
+
+### Providing Dependencies (`provide` vs `provideAs` vs `provideWithHierarchy`)
+
+Choose the method that matches how consumers declare their constructor parameters:
+
+| Registration Call | What Keys Are Registered in `DependencyInjector` | When to Use |
+| :--- | :--- | :--- |
+| `provide(instance)` | Registers **only** `instance.javaClass` (concrete type). | Standard concrete classes (`MyConfig`, `PluginScope` implementation, `ClanRepository`). |
+| `provide(a, b, c)` | Convenience vararg wrapper calling `provide` on each item. | Registering multiple concrete instances in one line. |
+| `provideAs(Interface::class.java, impl)` | Registers **one explicit interface/supertype** -> `impl`. | When listeners depend on an interface `Storage`, not `PostgresStorage`. |
+| `provideWithHierarchy(instance)` | Registers the concrete class **plus** all superclasses (stopping before `Any`/`Object`) **plus** all recursively implemented interfaces (via `putIfAbsent`). | Best for `this@MyPlugin` (so listeners can ask for `MyPlugin`, `BasePluginLifecycle`, or `PluginLifecycle` seamlessly!). |
+
+> **Common Pitfall:** Notice what happens if a listener constructor declares `class JoinListener(private val plugin: PluginLifecycle)`:
+> - Calling `provide(this@MyPlugin)` registers only `MyPlugin::class.java` -> constructor resolution fails because `PluginLifecycle::class.java` is a different exact `Class<*>` key!
+> - Calling `provideWithHierarchy(this@MyPlugin)` (or `provideAs(PluginLifecycle::class.java, this@MyPlugin)`) solves this immediately.
+
+---
+
+## Inspecting Scan Diagnostics (`ScanResult`)
+
+`scope.scan { ... }` returns a `ScanResult` object so you can verify exactly what was discovered per package:
+
+```kotlin
+val scanResult = scope.scan {
+    provideWithHierarchy(this@MyPlugin)
+    listeners()
+    commands()
+}
+
+logger().info("Scanned total classes: ${scanResult.amountClasses()}")
+for (packageResult in scanResult.results) {
+    logger().debug(
+        "Package '${packageResult.packageName}' registered ${packageResult.classes.size} class(es) " +
+            "using ${packageResult.registrar.javaClass.simpleName}",
+    )
+}
+```
+
+---
+
+## Going Deeper: Writing Custom Registrars (`ObjectRegistrar<T>`)
+
+Built-in `listeners()` (`ListenerRegistrar`) and `commands()` (`CommandRegistrar`) are simply implementations of a tiny interface in `:sdk:common`:
+
+```kotlin
+interface ObjectRegistrar<T : Any> {
+    val targetType: Class<T>
+    fun registrar(instance: T)
+}
+```
+
+Because `DefaultPackageScanner` checks `registrar.targetType.isAssignableFrom(clazz)` *before* calling constructors, you can create custom registrars for any abstraction in your plugin — such as gameplay modules, packet handlers, or minigame kits:
+
+```kotlin
+package com.example.myplugin.scanner
+
+import dev.sectile.kernel.Kernel
+import dev.sectile.network.api.packet.handler.PacketHandler
+import dev.sectile.sdk.extension.packetHandlers
+import dev.sectile.sdk.scanner.registrar.ObjectRegistrar
+
+object PacketHandlerRegistrar : ObjectRegistrar<PacketHandler> {
+
+    override val targetType: Class<PacketHandler> = PacketHandler::class.java
+
+    override fun registrar(instance: PacketHandler) {
+        val scope = Kernel.pluginScopeFactory.acquire(instance)
+        scope.packetHandlers().add(instance)
+    }
+}
+```
+
+Then wire it directly into your `scope.scan` block:
+
+```kotlin
+scope.scan {
+    provide(scope, profileCache)
+    provideWithHierarchy(this@MyPlugin)
+    listeners()
+    commands()
+    registrar(PacketHandlerRegistrar, "com.example.myplugin.packets")
+}
+```
+
+### Under the Hood (`DefaultPackageScanner`)
+
+1. `ScannerProvider` inside your `PluginScope` retrieves your plugin's `PluginSnapshot` from `Kernel.pluginCatalog` and builds a `DefaultPackageScanner` bound to your `Thread.currentThread().contextClassLoader` and a dedicated `"<id> Scanner"` logger.
+2. When scanning `.jar` resources, `DefaultPackageScanner.scanJar` sets `connection.useCaches = false` on `JarURLConnection` and closes the `JarFile` inside `.use {}`, ensuring hot-reloads on Windows never read stale zip tables or hold file locks.
+3. Classes are loaded with `Class.forName(className, false, classLoader)` so classes that don't match `registrar.targetType` are never statically initialized or instantiated.
+
+---
+
+**Next Step:** You now have every core fundamental (`@Plugin`, `@Bootstrap`, `ConfigSection`, `PluginScope`, and `PackageScanner`) under your belt. Let's start building real gameplay systems in [**Part 3 — Chapter 07 — Events & Execution Phases**](/03-building-gameplay/07-events-and-phases/).

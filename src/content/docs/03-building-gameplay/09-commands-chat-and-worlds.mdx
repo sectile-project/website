@@ -1,0 +1,195 @@
+---
+title: "Chapter 09 — Commands, Rich Chat & Worlds"
+description: "Chapter 09 — Commands, Rich Chat & Worlds - part of the Sectile developer documentation."
+---
+
+Now let's connect gameplay directly to players: parsing typed commands with flags and tab completion, styling multi-part chat messages cleanly, and moving players across worlds.
+
+---
+
+## Part 1: Commands (`BaseCommand` & Command DSL)
+
+Sectile's command subsystem follows the same capability split as events and services:
+- **Dispatch & resolution**: Global via `Engine.commands` (`CommandDispatcher`).
+- **Registration**: Scoped via `scope.commands()` (`CommandRegistry`).
+
+Every command registered through `scope.commands()` automatically synchronizes the updated command tree to online clients (`syncCommandTreeToAll`), executes under your plugin's `ClassLoader` (`TCCL`), and unregisters all command names, aliases, and custom tab-completers when your plugin reloads.
+
+### Simple Start: The Functional Command DSL
+
+For quick commands directly in `enable()`, use `scope.commands().register(...)`:
+
+```kotlin
+import dev.sectile.engine.chat.color.Color
+import dev.sectile.engine.chat.component.Message
+import dev.sectile.sdk.command.register
+import dev.sectile.sdk.extension.commands
+import dev.sectile.sdk.extension.scope
+
+override fun enable() {
+    scope.commands().register("ping", description = "Check server responsiveness.") {
+        aliases("p")
+        permission("example.ping")
+
+        executesPlayer(rejectMessage = "Only in-game players can run /ping.") { player, _ ->
+            Message.of("Pong! Hello ${player.username}", Color.GREEN).sendTo(player)
+        }
+    }
+}
+```
+
+### Structured Commands (`BaseCommand`)
+
+For larger commands (or commands auto-discovered by [`scope.scan { commands() }`](/02-plugin-fundamentals/06-package-scanner-and-di/)), subclass `BaseCommand`:
+
+```kotlin
+package com.example.myplugin.commands
+
+import dev.sectile.engine.api.command.BaseCommand
+import dev.sectile.engine.api.command.CommandSender
+import dev.sectile.engine.api.command.argument.Arguments
+import dev.sectile.engine.chat.color.Color
+import dev.sectile.engine.chat.component.Message
+import dev.sectile.sdk.command.argPlayer
+import dev.sectile.sdk.command.argWorld
+import dev.sectile.sdk.command.subcommand
+
+class WarpCommand : BaseCommand(
+    name = "warp",
+    description = "Teleport players between worlds.",
+    aliases = listOf("w"),
+    permission = "example.warp",
+) {
+    init {
+        // Optional flags (`--silent` or `-s`)
+        flag("silent", "s", description = "Skip notification to target player.")
+
+        // Typed positional arguments with automatic tab completion
+        argPlayer("target", description = "Player to teleport")
+        argWorld("world", description = "Destination world")
+
+        // Nested subcommand (`/warp list`)
+        subcommand("list", description = "List available worlds.") {
+            executes { sender, _ ->
+                val worldIds = dev.sectile.engine.api.Engine.worlds.all().joinToString(", ") { it.id }
+                Message.of("Worlds: $worldIds", Color.AQUA).sendTo(sender)
+            }
+        }
+    }
+
+    override fun execute(sender: CommandSender, args: Arguments) {
+        if (permission != null && !sender.hasPermission(permission!!)) {
+            Message.of("You lack permission '$permission'.", Color.RED).sendTo(sender)
+            return
+        }
+
+        val target = args.nextPlayer()
+        val destination = args.nextWorld()
+        val silent = args.hasFlag("silent", "s")
+
+        if (target == null || destination == null) {
+            Message.of("Usage: /warp <player> <world> [--silent]", Color.RED).sendTo(sender)
+            return
+        }
+
+        target.world.move(target, destination)
+
+        if (!silent) {
+            Message.of("Teleported to ${destination.name}.", Color.GREEN).sendTo(target)
+        }
+        Message.of("Moved ${target.username} to ${destination.name}.", Color.GREEN).sendTo(sender)
+    }
+}
+```
+
+### Typed Arguments, Flags & Tab Completion
+
+`sdk:common` provides helpful argument builders on any `BaseCommand`:
+- `argPlayer("target")` -> Uses `"player"` completer (live usernames from `Engine.players`).
+- `argWorld("world")` -> Uses `"world"` completer (world IDs from `Engine.worlds`).
+- `argBoolean("enabled")` -> Suggests `"true"`, `"false"`.
+- `argEnum<MyMode>("mode")` -> Suggests lowercase enum constant names.
+- `argChoices("rarity", "common", "rare", "epic")` -> Suggests fixed choices.
+- `arg("kit") { kitRepository.listIds() }` -> Custom dynamic lambda completer!
+
+**Parsing Arguments (`Arguments`)**:
+- Cursor-based readers advance automatically: `nextString()`, `nextInt()`, `nextInt(default)`, `nextPositiveInt()`, `nextDouble()`, `nextBoolean(default)`, `nextUuid()`, `nextPlayer()`, `nextWorld()`, `nextEnum<E>()`.
+- Check flags anywhere on the line with `args.hasFlag("silent", "s")`.
+- Rewind or inspect randomly with `args.remaining()`, `args.seek(index)`, `args.reset()`, and `args[index]`.
+
+**Automatic Tab-Completer Cleanup & Cache Invalidation**:
+When a command defines custom lambda completers (`arg(...) { ... }`), `DefaultCommandRegistry` assigns generated argument type IDs (`CommandTreeBuilder.argTypeIdFor`), wraps callbacks in your plugin's `ClassLoader`, and automatically deletes those entries when the command unregisters on plugin unload. If dynamic choices change while players are online (e.g., an admin adds a new arena), call `scope.commands().invalidateArgCache(...)` to tell clients to refresh suggestions.
+
+---
+
+## Part 2: Rich Chat & Messaging (`:engine:chat`)
+
+Sending plain strings via `sender.receiveMessage("Hello")` works for simple text, while colored, styled, clickable, or translatable messages use `Message` and `Color`.
+
+```kotlin
+import dev.sectile.engine.chat.color.Color
+import dev.sectile.engine.chat.component.Message
+import dev.sectile.engine.chat.component.receiveMessage
+
+val welcome = Message("[Welcome] ").apply {
+    color = Color.GOLD
+    bold = true
+}.append("Welcome to Sectile, ") {
+    color = Color.WHITE
+    bold = false
+}.append(player.username) {
+    color = Color.AQUA
+    underline = true
+}.append("!") {
+    color = Color.WHITE
+}
+
+// Send to one player or console:
+welcome.sendTo(player)
+player.receiveMessage(welcome)
+
+// Or broadcast efficiently to everyone online:
+welcome.broadcast()
+```
+
+### Styling Options & `Color`
+- **Bitmask styles** on `Message`: `bold`, `italic`, `monospace`, `strikethrough`, `underline`, `markupEnabled`, `link` (clickable URL), and `messageId` (via `Message.translatable("key")`).
+- **`Color` helpers**: Named colors (`Color.GOLD`, `Color.DARK_AQUA`, `Color.RED`, etc.), `Color.rgb(255, 128, 0)`, `Color.hex("#1E90FF")` / `Color.hex(0x1E90FF)`, `Color.cmyk(...)`, and `Color.gray(...)`.
+
+### Automatic Wire Optimization
+Under the hood, `Message.toPacket()` inspects `Message.isRaw`:
+- If a message has **no** styling flags, links, or child nodes (`isRaw == true`), Sectile emits the tiny `RawMessagePacket` automatically.
+- Only styled/composite trees emit the richer `ServerMessagePacket`.
+- When sending to multiple players (`Message.broadcast()` or `Message.sendTo(receivers)`), player recipients share a single pre-encoded frame via `NetworkConnector.packetsSender` while console/non-player receivers cleanly receive `toPlainText()`.
+
+---
+
+## Part 3: Worlds (`WorldCatalog` & `WorldRegistry`)
+
+Query active worlds from anywhere via `Engine.worlds` (`WorldCatalog`):
+
+```kotlin
+import dev.sectile.engine.api.Engine
+
+val defaultWorld = Engine.worlds.default
+val lobby = Engine.worlds.byId("lobby") ?: Engine.worlds.byName("Lobby")
+val allWorlds = Engine.worlds.all()
+```
+
+Register custom `World` implementations cleanly inside your **`PluginScope`** so Sectile removes them automatically if your plugin unloads:
+
+```kotlin
+import dev.sectile.sdk.extension.scope
+import dev.sectile.sdk.extension.worlds
+
+override fun enable() {
+    val arenaWorld = createCustomWorld("arena_1")
+    scope.worlds().register(arenaWorld)
+}
+```
+
+When moving a player from one world to another, call `player.world.move(player, targetWorld)` so player lists on both worlds and `player.world` update consistently in one call.
+
+---
+
+**Next Step:** You can now run commands, chat, events, services, and worlds. Next, make sure blocking I/O and game timers never freeze server threads or leak workers in [**Chapter 10 — Concurrency & Schedulers**](/03-building-gameplay/10-concurrency-and-schedulers/).

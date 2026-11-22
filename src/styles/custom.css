@@ -1,0 +1,485 @@
+:root {
+  /* Brand aliases */
+  --sectile-lime: #cfff00;
+  --sectile-blue: #3000ff;
+  --sectile-ink: #111111;
+  --sectile-panel: #151515;
+  --sectile-paper: #fefefe;
+  --sectile-gradient: linear-gradient(
+    100deg,
+    #cfff00 0%,
+    #74ff57 28%,
+    #2ecbdb 62%,
+    #3000ff 100%
+  );
+
+  /* Typography & layout */
+  --sl-font: 'DM Sans', sans-serif;
+  --sl-content-width: 47rem;
+  --sl-line-height: 1.75;
+
+  /* ---- Dark theme (default) ---- */
+  --sl-color-white: #fefefe;
+  --sl-color-gray-1: #ededed;
+  --sl-color-gray-2: #cfcfcf;
+  --sl-color-gray-3: #a1a1a1;
+  --sl-color-gray-4: #717171;
+  --sl-color-gray-5: #3d3d3d;
+  --sl-color-gray-6: #151515;
+  --sl-color-black: #111111;
+
+  --sl-color-blue-low: #1a008f;
+  --sl-color-blue: #3000ff;
+  --sl-color-blue-high: #a08bff;
+
+  --sl-color-accent-low: #2a3800;
+  --sl-color-accent: #cfff00;
+  --sl-color-accent-high: #dbff55;
+
+  --sl-color-bg-nav: #151515;
+  --sl-color-bg-sidebar: #151515;
+  --sl-color-bg-inline-code: #202020;
+  --sl-color-hairline-light: #242424;
+  --sl-color-hairline: #2c2c2c;
+  --sl-color-hairline-shade: #0c0c0c;
+  --sl-color-backdrop-overlay: rgb(0 0 0 / 72%);
+}
+
+:root[data-theme='light'] {
+  /* ---- Light theme ---- */
+  --sl-color-white: #111111;
+  --sl-color-gray-1: #1c1c1c;
+  --sl-color-gray-2: #343434;
+  --sl-color-gray-3: #575757;
+  --sl-color-gray-4: #8b8b8b;
+  --sl-color-gray-5: #d6d6d2;
+  --sl-color-gray-6: #ececeb;
+  --sl-color-gray-7: #f6f6f4;
+  --sl-color-black: #fefefe;
+
+  /* Blue keeps links readable on a light background. */
+  --sl-color-accent-low: #e9e3ff;
+  --sl-color-accent: #3000ff;
+  --sl-color-accent-high: #2300b4;
+
+  --sl-color-blue-low: #e9e3ff;
+  --sl-color-blue: #3000ff;
+  --sl-color-blue-high: #2300b4;
+
+  --sl-color-bg-nav: #f6f6f4;
+  --sl-color-bg-sidebar: #fefefe;
+  --sl-color-bg-inline-code: #efefec;
+  --sl-color-hairline-light: #e6e6e2;
+  --sl-color-hairline: #d9d9d4;
+  --sl-color-hairline-shade: #e6e6e2;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Brand details                                                              */
+/* -------------------------------------------------------------------------- */
+
+/* Early-development announcement banner (rendered by Starlight). */
+.sl-banner {
+  --sl-color-banner-bg: var(--sectile-blue);
+  --sl-color-banner-text: #ffffff;
+  padding: 0.5rem 1rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  box-shadow: none;
+}
+
+.sl-banner a {
+  font-weight: 800;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+::selection {
+  background: var(--sectile-lime);
+  color: var(--sectile-ink);
+}
+
+:where(a, button, summary):focus-visible {
+  outline: 2px solid var(--sectile-blue);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.site-title {
+  font-weight: 800;
+  letter-spacing: -0.025em;
+}
+
+/* Keep the logo and the site name side by side, including on mobile. */
+.title-wrapper,
+.site-title {
+  flex-wrap: nowrap;
+  flex-direction: row;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.site-title {
+  gap: 0.5rem;
+}
+
+.site-title img {
+  flex: none;
+  width: auto;
+  height: 1.75rem;
+}
+
+@media (max-width: 40rem) {
+  .site-title img {
+    height: 1.5rem;
+  }
+}
+
+/* Built-in Starlight hero */
+.hero h1 {
+  background: var(--sectile-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  letter-spacing: -0.035em;
+}
+
+:root[data-theme='light'] .hero h1 {
+  background: linear-gradient(100deg, #1f9e00 0%, #006ec7 55%, #3000ff 100%);
+}
+
+.hero .tagline {
+  color: var(--sl-color-gray-2);
+  font-size: var(--sl-text-lg);
+}
+
+/* Sidebar: mark the active page with an accent bar. */
+nav a[aria-current='page'] {
+  box-shadow: inset 3px 0 0 var(--sectile-lime);
+}
+
+:root[data-theme='light'] nav a[aria-current='page'] {
+  box-shadow: inset 3px 0 0 var(--sectile-blue);
+}
+
+/* Starlight UI cards */
+.card {
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.75rem;
+  transition: border-color 160ms ease, transform 160ms ease;
+}
+
+.card:hover {
+  border-color: var(--sectile-lime);
+  transform: translateY(-2px);
+}
+
+:root[data-theme='light'] .card:hover {
+  border-color: var(--sectile-blue);
+}
+
+/* Inline code and code blocks */
+:not(pre) > code {
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.35rem;
+}
+
+.expressive-code {
+  --ec-brdRad: 0.75rem;
+}
+
+/* Hide the scrollbars in both sidebars. */
+.sidebar-pane,
+.right-sidebar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  scrollbar-gutter: auto;
+}
+
+.sidebar-pane::-webkit-scrollbar,
+.right-sidebar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Keep the table of contents compact without breaking Starlight's layout math. */
+@media (min-width: 72rem) {
+  .right-sidebar-container,
+  [data-has-sidebar][data-has-toc] .main-pane {
+    --sl-sidebar-width: 16rem;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Landing page                                                               */
+/* -------------------------------------------------------------------------- */
+
+/* Give the splash page more room than a normal documentation page. */
+body:has(.sectile-home) .sl-markdown-content {
+  max-width: none;
+}
+
+body:has(.sectile-home) .sl-container {
+  max-width: 1200px;
+}
+
+/* The page title is replaced by the custom hero heading on the home page. */
+body:has(.sectile-home) .sl-container > h1#_top,
+body:has(.sectile-home) main > .content-panel:has(> .sl-container > h1#_top) {
+  display: none;
+}
+
+.sectile-home {
+  width: min(1200px, 100%);
+  margin-inline: auto;
+  padding: 0 clamp(1rem, 4vw, 2.5rem) 4rem;
+}
+
+.sectile-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+  align-items: center;
+  gap: clamp(2rem, 5vw, 5rem);
+  padding: clamp(1.5rem, 3vw, 3rem) 0 clamp(2rem, 5vw, 4rem);
+  min-height: 20rem;
+}
+
+.sectile-hero__copy h1 {
+  margin: 0 0 1.5rem;
+  font-size: clamp(3rem, 6.5vw, 5.5rem);
+  line-height: 1.08;
+  letter-spacing: -0.02em;
+  font-weight: 800;
+  color: var(--sl-color-white);
+}
+
+.sectile-tag {
+  display: inline-block;
+  padding: 0 0.28em 0.06em;
+  border-radius: 0.25rem;
+  line-height: 1.1;
+}
+
+.sectile-tag--lime {
+  background: var(--sectile-lime);
+  color: var(--sectile-ink);
+}
+
+.sectile-tag--blue {
+  background: var(--sectile-blue);
+  color: #ffffff;
+}
+
+.sectile-hero__lead {
+  margin: 0 0 1.25rem;
+  color: var(--sl-color-gray-2);
+  font-size: 0.95rem;
+  line-height: 1.9;
+}
+
+.sectile-hero__lead strong {
+  color: var(--sectile-lime);
+  font-weight: 700;
+}
+
+:root[data-theme='light'] .sectile-hero__lead strong {
+  color: #1f8a00;
+}
+
+.sectile-hero__built {
+  margin: 0 0 2rem;
+  color: var(--sl-color-gray-3);
+  font-size: 0.85rem;
+}
+
+.sectile-hero__built a {
+  color: var(--sl-color-blue);
+  text-decoration-color: currentColor;
+  text-underline-offset: 0.2em;
+}
+
+.sectile-hero__cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.6rem 1.1rem;
+  border: 1px solid var(--sectile-lime);
+  border-radius: 0.5rem;
+  background: rgb(207 255 0 / 8%);
+  color: var(--sectile-lime);
+  font-size: 0.85rem;
+  font-weight: 700;
+  text-decoration: none;
+  transition: background 160ms ease, color 160ms ease, transform 160ms ease;
+}
+
+.sectile-hero__cta span {
+  font-family: var(--sl-font-system-mono);
+  font-size: 0.8rem;
+}
+
+.sectile-hero__cta:hover {
+  background: var(--sectile-lime);
+  color: var(--sectile-ink);
+  transform: translateY(-2px);
+}
+
+:root[data-theme='light'] .sectile-hero__cta {
+  border-color: var(--sectile-blue);
+  background: rgb(48 0 255 / 6%);
+  color: var(--sectile-blue);
+}
+
+:root[data-theme='light'] .sectile-hero__cta:hover {
+  background: var(--sectile-blue);
+  color: #ffffff;
+}
+
+.sectile-hero__art {
+  display: flex;
+  justify-content: center;
+}
+
+.sectile-hero__logo {
+  width: min(100%, 28rem);
+  height: auto;
+}
+
+.sectile-hero__logo--light {
+  display: none;
+}
+
+:root[data-theme='light'] .sectile-hero__logo--dark {
+  display: none;
+}
+
+:root[data-theme='light'] .sectile-hero__logo--light {
+  display: block;
+}
+
+.sectile-docs h2 {
+  margin: 0;
+  font-size: clamp(1.8rem, 3vw, 2.4rem);
+  letter-spacing: -0.03em;
+  color: var(--sl-color-white);
+}
+
+.sectile-docs__subtitle {
+  margin: 0.5rem 0 0;
+  color: var(--sl-color-gray-2);
+  font-size: 1.15rem;
+}
+
+.sectile-part {
+  margin-top: 2.5rem;
+}
+
+.sectile-part h3 {
+  margin: 0 0 1rem;
+  color: var(--sl-color-gray-2);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.sectile-card-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.sectile-card {
+  display: block;
+  padding: 1.1rem 1.15rem 1.2rem;
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.6rem;
+  background: var(--sectile-panel);
+  color: inherit;
+  text-decoration: none;
+  transition: border-color 160ms ease, transform 160ms ease, background 160ms ease;
+}
+
+.sectile-card:hover {
+  border-color: var(--sectile-lime);
+  background: #1b1b1b;
+  transform: translateY(-3px);
+}
+
+.sectile-card__index {
+  display: block;
+  color: var(--sectile-lime);
+  font-family: var(--sl-font-system-mono);
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
+.sectile-card h4 {
+  margin: 0.45rem 0 0.4rem;
+  color: var(--sl-color-white);
+  font-size: 0.95rem;
+  line-height: 1.35;
+}
+
+.sectile-card p {
+  margin: 0;
+  color: var(--sl-color-gray-3);
+  font-size: 0.78rem;
+  line-height: 1.55;
+}
+
+:root[data-theme='light'] .sectile-card {
+  background: #f6f6f4;
+}
+
+:root[data-theme='light'] .sectile-card:hover {
+  border-color: var(--sectile-blue);
+  background: #f0f0ed;
+}
+
+:root[data-theme='light'] .sectile-card__index {
+  color: #1f8a00;
+}
+
+@media (max-width: 50rem) {
+  .sectile-hero {
+    grid-template-columns: 1fr;
+    text-align: left;
+  }
+
+  .sectile-hero__art {
+    order: -1;
+  }
+
+  .sectile-hero__logo {
+    width: min(100%, 22rem);
+  }
+
+  .sectile-card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 40rem) {
+  .sectile-card-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Accessible motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .card,
+  .sectile-card,
+  .sectile-hero__cta {
+    transition: none;
+  }
+}

@@ -1,0 +1,199 @@
+---
+title: "Chapter 11 — Login & Connection Stages"
+description: "Chapter 11 — Login & Connection Stages - part of the Sectile developer documentation."
+---
+
+So far we have assumed players are already standing in a world running commands and chat. Now let's follow what happens **the moment a Hytale client clicks Connect** all the way until they spawn in game — and how your plugin can safely intercept, validate, redirect, or pause that connection cleanly.
+
+---
+
+## Why a Login State Machine?
+
+In poorly structured servers, connection login quickly turns into fragile spaghetti: a boolean `isAuthenticated`, a boolean `isPasswordChecked`, a boolean `assetsSent`, and packet handlers trying to remember what packets are legal right now.
+
+Sectile models the entire connection lifecycle as an explicit **Stage Machine** (`ConnectionStage` + `StageSteps`):
+- Each connection is in **one** clear `ConnectionStage` at any moment.
+- Stages enforce which packets are legal right now (`strict = true` vs `strict = false`), disconnecting out-of-order clients immediately.
+- Plugins extend login via **`scope.stageHooks()`** without touching Netty sockets or risking race conditions with core auth handlers.
+
+---
+
+## A Player's Journey Through the 6 Stages
+
+From initial connection to active gameplay, every `PlayerConnection` walks through a subset of six stages depending on whether the server requires authentication (`auth.mode = authenticated` vs `insecure`) and a server password:
+
+```text
+  HANDSHAKE ──┬──(auth.mode = INSECURE)─────▶ INSECURE_OPTIONS ──┬──(no password)──┐
+              │                                                   └──(password req)─┼──▶ PASSWORD ──┐
+              └──(auth.mode = AUTHENTICATED)─▶ AUTHENTICATION ───┬──(no password)──┘                │
+                                                                 └──────────────────────────────────┴──▶ PRE_LOGIN ──▶ POST_LOGIN
+```
+
+| Stage | `strict` | Timeout | What Happens Here |
+| :--- | :--- | :--- | :--- |
+| `HANDSHAKE` | `true` | Config `read-timeout` (`30s`) | Client sends `ConnectPacket` (`id=0`). Server validates protocol CRC/build and routes to online auth or insecure mode. |
+| `AUTHENTICATION` | `true` | `30s` (+5s grace) | Validated mode: verifies client JWT identity token, requests authorization grant from Hytale Session Service, verifies `AuthToken` + client cert binding (`cnf.x5t#S256`), sends `ServerAuthToken`. |
+| `INSECURE_OPTIONS` | `true` | `20s` (+5s grace) | Offline/dev mode: asks client for desired username, UUID, and skin (`RequestInsecurePlayerOptions` -> `InsecurePlayerOptions`), then replies with `ConnectAccept`. |
+| `PASSWORD` | `true` | `45s` (+5s grace) | Optional password challenge loop (`PasswordResponse` verifying SHA-256 of `challenge + password`). |
+| `PRE_LOGIN` | `false` | Config `play-timeout` (`120s`) | Initializes `PlayerSessionState`, sends `WorldSettings` & `ServerInfo`, streams requested game assets (`RequestAssets` -> `AssetInitialize` / `AssetPart` / `AssetFinalize`), waits for `SetupFinalize`. |
+| `POST_LOGIN` | `false` | Config `play-timeout` (`120s`) | Opens auxiliary `CHUNKS` & `WORLD_MAP` streams, lets engine join the player into a `World` (`world-join`), waits for `ClientReady`, sends spawn chunks, and runs periodic `Ping`/`NetworkTick` keepalives. |
+
+### Why `strict = true` Protects Your Server
+
+During the four early login stages (`HANDSHAKE`, `AUTHENTICATION`, `INSECURE_OPTIONS`, `PASSWORD`), `strict` is `true`:
+- Only packets registered for that exact stage are accepted (for example, `Connect` in `HANDSHAKE`, `AuthToken` in `AUTHENTICATION`, `ClientDisconnect`).
+- If an unauthenticated client attempts to spoof a gameplay packet (`ChatMessage`, `ClientMovement`, etc.) before finishing login, **`PacketDecoder` closes the connection immediately as a protocol violation** before even allocating payload buffers.
+
+---
+
+## Canonical Steps Reference (`StageSteps`)
+
+Every stage is broken down into fine-grained named steps declared as compile-time constants in `dev.sectile.network.api.player.stage.StageSteps`:
+
+| Stage | Step Constant (`StageSteps.*`) | Trigger |
+| :--- | :--- | :--- |
+| `HANDSHAKE` | `HANDSHAKE_CONNECT_ACCEPTANCE` | `ConnectPacket` |
+| `HANDSHAKE` | `HANDSHAKE_PROTOCOL_COMPATIBILITY` | `ConnectPacket` |
+| `HANDSHAKE` | `HANDSHAKE_REFERRAL_DATA` | `ConnectPacket` |
+| `HANDSHAKE` | `HANDSHAKE_LOGIN_FLOW` | `ConnectPacket` |
+| `AUTHENTICATION` | `AUTHENTICATION_IDENTITY_TOKEN` | Stage Entry |
+| `AUTHENTICATION` | `AUTHENTICATION_AUTHORIZATION_GRANT` | Stage Entry |
+| `AUTHENTICATION` | `AUTHENTICATION_ACCESS_TOKEN` | `AuthTokenPacket` |
+| `AUTHENTICATION` | `AUTHENTICATION_SERVER_AUTH_TOKEN` | `AuthTokenPacket` |
+| `INSECURE_OPTIONS` | `INSECURE_OPTIONS_REQUEST_PLAYER_OPTIONS` | Stage Entry |
+| `INSECURE_OPTIONS` | `INSECURE_OPTIONS_PLAYER_IDENTITY` | `InsecurePlayerOptionsPacket` |
+| `INSECURE_OPTIONS` | `INSECURE_OPTIONS_PASSWORD_CHALLENGE` | `InsecurePlayerOptionsPacket` |
+| `PASSWORD` | `PASSWORD_CHALLENGE_VALIDATION` | `PasswordResponsePacket` |
+| `PASSWORD` | `PASSWORD_VERIFICATION` | `PasswordResponsePacket` |
+| `PASSWORD` | `PASSWORD_ACCEPT` | `PasswordResponsePacket` |
+| `AUTH / INSECURE / PASSWORD` | `LOGIN_COMPLETION` | End of Login (populates `PlayerAuthentication` & `entityId`) |
+| `PRE_LOGIN` | `PRE_LOGIN_SESSION_START` | Stage Entry |
+| `PRE_LOGIN` | `PRE_LOGIN_LOGIN_NOTIFY` | Stage Entry |
+| `PRE_LOGIN` | `PRE_LOGIN_WORLD_SETTINGS` | Stage Entry |
+| `PRE_LOGIN` | `PRE_LOGIN_ASSET_LOADING` | Stage Entry |
+| `PRE_LOGIN` | `PRE_LOGIN_ASSET_DELIVERY` | `RequestAssetsPacket` |
+| `PRE_LOGIN` | `PRE_LOGIN_SETUP_FINALIZE` | `SetupFinalizePacket` |
+| `POST_LOGIN` | `POST_LOGIN_WORLD_JOIN` | Stage Entry |
+| `POST_LOGIN` | `POST_LOGIN_CLIENT_READY` | `ClientReadyPacket` |
+| `POST_LOGIN` | `POST_LOGIN_NETWORK_TASKS` | `ClientReadyPacket` |
+
+---
+
+## Intercepting Login With `scope.stageHooks()`
+
+> **Important Rule:** Plugins never register raw packet handlers (`scope.packetHandlers()`) for login stages (`Connect`, `AuthToken`, `PasswordResponse`) — doing so would race against core authentication steps without being able to pause or block login. Always use **`scope.stageHooks()`**!
+
+You can hook **`before(...)`** or **`after(...)`** any specific `StepPoint(stage, step)`, or monitor all transitions globally via `beforeEveryStep` / `afterEveryStep`.
+
+Your hook receives a `StepContext` (`connection`, `point`, `phase`, resolved `login: LoginSnapshot?`, and `resume(...)`) and returns a **`StepDecision`**:
+
+1. `StepDecision.Continue` — Proceed normally.
+2. `StepDecision.Reject(reason)` — Disconnect gracefully with a message/translation key.
+3. `StepDecision.Redirect(stage)` — Jump directly to another `ConnectionStage` (for instance, custom 2FA password step).
+4. `StepDecision.Hold` — Pause the login pipeline **without blocking the Netty event-loop thread**, then resume asynchronously later via `ctx.resume(decision)`!
+
+When multiple hooks share the same point and phase, they run in registration order and **the first non-`Continue` decision wins**.
+
+### Example 1: Synchronous Whitelist Check
+
+```kotlin
+import dev.sectile.kernel.plugin.spi.lifecycle.BasePluginLifecycle
+import dev.sectile.network.api.player.connection.ConnectionStage
+import dev.sectile.network.api.player.stage.StageSteps
+import dev.sectile.network.api.player.stage.StepDecision
+import dev.sectile.network.api.player.stage.StepPoint
+import dev.sectile.sdk.extension.scope
+import dev.sectile.sdk.extension.stageHooks
+import dev.sectile.sdk.plugin.annotation.Plugin
+
+@Plugin(id = "whitelist", version = "1.0.0")
+class WhitelistPlugin : BasePluginLifecycle() {
+
+    private val allowedUsers = setOf("Admin", "Tester")
+
+    override fun enable() {
+        // By PRE_LOGIN_SESSION_START, login.uuid and login.username are populated in both auth and insecure modes:
+        scope.stageHooks().before(
+            StepPoint(ConnectionStage.PRE_LOGIN, StageSteps.PRE_LOGIN_SESSION_START),
+        ) { ctx ->
+            val username = ctx.login?.username ?: return@before StepDecision.Reject("Missing identity.")
+            if (username !in allowedUsers) {
+                StepDecision.Reject("Server is currently in whitelist maintenance.")
+            } else {
+                StepDecision.Continue
+            }
+        }
+    }
+}
+```
+
+### Example 2: Asynchronous External Ban / Anti-Bot Check (`Hold` & `resume`)
+
+> **Warning:** `StageHook.onStep` runs directly on the Netty I/O thread! **Never perform SQL or HTTP I/O synchronously inside `onStep`** — return `StepDecision.Hold`, offload the work to `scope.virtualThreads()`, and dispatch `ctx.resume(...)` back onto `ctx.connection.execute`.
+
+```kotlin
+import dev.sectile.network.api.player.connection.ConnectionStage
+import dev.sectile.network.api.player.stage.StageSteps
+import dev.sectile.network.api.player.stage.StepDecision
+import dev.sectile.network.api.player.stage.StepPoint
+import dev.sectile.sdk.extension.scope
+import dev.sectile.sdk.extension.stageHooks
+import dev.sectile.sdk.extension.virtualThreads
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+
+override fun enable() {
+    val http = HttpClient.newHttpClient()
+    scope.onClose { http.close() }
+
+    val ioExecutor = scope.virtualThreads()
+
+    scope.stageHooks().after(
+        StepPoint(ConnectionStage.PRE_LOGIN, StageSteps.PRE_LOGIN_SESSION_START),
+    ) { ctx ->
+        val ip = ctx.connection.getIp()
+        val uuid = ctx.login?.uuid
+
+        ioExecutor.submit {
+            val isBlocked = runCatching {
+                val request = HttpRequest.newBuilder(
+                    URI.create("https://bans.example.com/check?uuid=$uuid&ip=$ip"),
+                ).build()
+                http.send(request, HttpResponse.BodyHandlers.ofString()).statusCode() == 403
+            }.getOrDefault(false)
+
+            // Resume safely on the connection's serialized Netty event loop:
+            ctx.connection.execute {
+                if (!ctx.connection.isOnline()) return@execute
+                if (isBlocked) {
+                    ctx.resume(StepDecision.Reject("You are banned from this network."))
+                } else {
+                    ctx.resume(StepDecision.Continue)
+                }
+            }
+        }
+
+        // Pause login pipeline immediately without stalling other players!
+        StepDecision.Hold
+    }
+}
+```
+
+Notice also that login stages maintain automatic stage timeouts (for instance `30s` in `AUTHENTICATION`, `20s` in `INSECURE_OPTIONS`, `45s` in `PASSWORD`), protecting the server if a held external check hangs.
+
+---
+
+## Working With `PlayerConnection`
+
+Every player exposes `player.connection` (`PlayerConnection`), giving plugins transport-independent access without leaking Netty internals:
+
+- **Identity & TLS metadata**: `stage`, `session` (`uuid`, `username`, `entityId`, `ready`, `viewRadiusChunks`), `authentication`, `clientCertificate: X509Certificate?`, `sniHostname: String?`, `getIp()`, `isOnline()`.
+- **Disconnecting**: `disconnect("Reason message")` (sends graceful `ServerDisconnect` first) or `close(ConnectionCloseCode.PROTOCOL_VIOLATION)`.
+- **Thread-safe attributes (`ConnectionKey<T>`)**: `getAttribute`, `setAttribute`, `getOrPutAttribute` *(remember Chapter 05: don't leave custom plugin-private classes stuck on live `PlayerConnection` attributes across hot-reloads!)*.
+- **Lifecycle tasks**: `execute`, `schedule`, `scheduleAtFixedRate`, and `onDisconnect` (all automatically scope-tracked).
+
+---
+
+**Next Step:** You now understand how connections authenticate and reach gameplay (`POST_LOGIN`). Finish Part 4 by looking straight down at the wire in [**Chapter 12 — Inside the Hytale Protocol (QUIC & Packets)**](/04-networking-and-protocol/12-hytale-protocol-quic-and-packets/).

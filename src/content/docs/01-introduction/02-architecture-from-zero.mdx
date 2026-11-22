@@ -1,0 +1,107 @@
+---
+title: "Chapter 02 — Architecture From Zero"
+description: "Chapter 02 — Architecture From Zero - part of the Sectile developer documentation."
+---
+
+If you open the Sectile repository for the first time, you see folders like `kernel/`, `networking/`, `engine/`, `sdk/`, and `launcher/`. Before memorizing module paths, let's build a clear mental model of **what each piece is** and **how they fit together**.
+
+---
+
+## Architecture vs. Code Structure
+
+People often confuse **software architecture** with **code structure**, so let's separate them with a simple analogy:
+
+- **Architecture** is the **master blueprint of a building**: it decides how many floors exist, where load-bearing columns go, how the electrical and plumbing shafts are isolated, and what rules prevent one apartment's renovation from collapsing the floor above it.
+- **Code structure** is **how each room is furnished**: where the desks go, how files are sorted in folders, and what package names you choose.
+
+If you have neat folders without architecture, your code looks clean on day one but collapses under coupling six months later. Sectile defines the blueprint **first** through five distinct layers.
+
+---
+
+## The Five Pillars of Sectile
+
+Every part of Sectile belongs to one of five conceptual layers, stacked from generic infrastructure up to developer experience:
+
+```text
++-------------------------------------------------------------------+
+|  5. SDK        Developer ergonomics, annotations, configs, scanner|
++-------------------------------------------------------------------+
+|  4. Engine     Game domain: Players, Worlds, Chat, Commands, Perms|
++-------------------------------------------------------------------+
+|  3. Networking QUIC transport, packets, compression, login stages |
++-------------------------------------------------------------------+
+|  2. Kernel     Generic microkernel: plugins, events, services     |
++-------------------------------------------------------------------+
+|  1. Launcher   Process boot, visibility rules, startup wiring     |
++-------------------------------------------------------------------+
+```
+
+Let's walk through what each pillar does — and just as importantly, what it intentionally refuses to do.
+
+### 1. Launcher — *"Boot and isolate, nothing else"*
+The **Launcher** is the outermost shell that starts the JVM process.
+- It reads initial server configuration (`plugins.yaml`, `network.yaml`), starts asynchronous console/file logging, sets up classloader isolation boundaries, initializes the remaining layers in order, and hands control to the interactive console.
+- It contains **zero gameplay logic**. Think of it as the ignition key and wiring harness of the server.
+
+### 2. Kernel — *"The tiny, domain-agnostic engine room"*
+The **Kernel** is a generic **microkernel**. Crucially, the Kernel knows **nothing about Hytale**: it has no idea what a player, block, world, chat packet, or sword is.
+
+Instead, it provides the universal runtime machinery every modular platform needs:
+- Discovering, loading, enabling, disabling, and reloading plugins
+- Tracking each plugin's owned resources (`PluginScope`) so everything cleans up on unload
+- Publishing and subscribing to events (`EventDispatcher` / `EventBus`)
+- Cross-plugin service lookup and registration (`ServiceCatalog` / `ServiceRegistry`)
+- Time-based scheduling & scoped virtual/platform thread executors (`Scheduler`, `SchedulerProvider`)
+- Structured logging and configuration interfaces (`Logger`, `ConfigService`)
+
+Because the Kernel does not know about game mechanics, it stays small, stable, and easy to reason about.
+
+### 3. Networking — *"Speak Hytale on the wire without polluting gameplay"*
+The **Networking** layer exists separately from Kernel and Engine because modern multiplayer transport (QUIC over UDP, mTLS certificates, binary framing, Zstd compression, and login handshakes) is complex on its own.
+- It implements Hytale's binary packet structures, wire codecs, and connection login pipeline (`ConnectionStage`).
+- Gameplay code and plugins interact with a clean, transport-agnostic interface (`PlayerConnection`) without importing Netty byte buffers or QUIC streams directly.
+
+### 4. Engine — *"Where the game domain begins"*
+The **Engine** models the actual world of the server:
+- Connected `Player` entities and permission checks (`PermissionService`)
+- `World` tracking (`WorldCatalog`, `WorldRegistry`) and player movement
+- Rich formatted chat components (`Message`, RGB `Color`)
+- Command parsing, execution, permission checks, and tab-completion (`Command`, `BaseCommand`, `CommandDispatcher`, `CommandRegistry`)
+
+### 5. SDK — *"API is not enough"*
+Why isn't having an API inside Kernel and Engine sufficient?
+- An **API** tells you *what contracts exist* (e.g., "a `Command` interface exists"). It does **not** solve how plugins are organized, how configs are parsed, how boilerplate is reduced, or how Gradle generates metadata.
+- If a server only ships a bare API, every developer ends up rewriting the same mini-frameworks (`ConfigManager`, reflection scanners, hand-written `manifest.json` descriptors, command argument parsers).
+
+The **SDK** turns Sectile's raw capabilities into a consistent, productive developer experience:
+- **Gradle Extension**: Processes `@Plugin`, `@Bootstrap`, and `@Dependency` annotations at compile time so you never write JSON manifests manually.
+- **Common SDK utilities**: Kotlin DSL extensions (`scope.eventbus()`, `scope.scan {}`, `command("...") {}` builders, `argPlayer`, `argWorld`).
+- **Bundled tools**: Zero-dependency YAML and JSON configuration parsers plus the runtime bytecode scanner (`DefaultPackageScanner`).
+
+---
+
+## How Server Startup Flows Through the Pillars
+
+When you launch Sectile, control flows cleanly across those layers in order:
+
+```text
+[IsolatedLauncher]
+   │  Separates public API JAR from private server code (explained in Chapter 03)
+   ▼
+[Launcher Boostrap (startServer)]
+   ├─ 1. Registers YAML & JSON configuration services
+   ├─ 2. Starts asynchronous console/file logger
+   ├─ 3. Initializes Microkernel -> binds Kernel global API + core scope providers
+   ├─ 4. Initializes Engine      -> binds Players, Worlds, Commands + engine scope providers
+   ├─ 5. Initializes SDK         -> binds Scanner, PacketHandler & StageHook scope providers
+   ├─ 6. Starts discovered plugins (PluginStarter respects dependency order!)
+   ├─ 7. Registers built-in commands (/plugins, /help, /who, /whereami, /stop, /auth)
+   ├─ 8. Starts QUIC UDP server & world/command network handlers
+   └─ 9. Opens the interactive console loop
+```
+
+Notice the ordering: the Kernel, Engine, and SDK providers are ready **before** plugins enable, and plugins load **before** networking finishes binding gameplay handlers and reporting startup complete.
+
+---
+
+**Next Step:** In [**Chapter 03 — API vs. Internals & Isolation**](/01-introduction/03-api-vs-internals-and-isolation/), you will see how each of these five pillars is split into public contracts vs. private internals, and how Sectile enforces that boundary at runtime.

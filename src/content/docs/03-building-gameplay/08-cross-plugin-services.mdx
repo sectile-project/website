@@ -1,0 +1,166 @@
+---
+title: "Chapter 08 — Cross-Plugin Services"
+description: "Chapter 08 — Cross-Plugin Services - part of the Sectile developer documentation."
+---
+
+Events work great for notifications (*"Player X just joined"*), but what when Plugin A needs to **ask** Plugin B a question or invoke a shared capability — like checking permissions or charging coins?
+
+---
+
+## Why Does `ServiceCatalog` / `ServiceRegistry` Exist?
+
+Imagine you are writing a Shop plugin, and you want it to withdraw money from players' accounts.
+- Without a shared service abstraction, your Shop plugin either has to hardcode support for five different third-party Economy plugins (*MyEcon*, *SimpleCoins*, *ProEconomy*...) or wait for a community bridge plugin like Bukkit's **Vault** to wrap interfaces after the fact.
+- **Permission checks have the exact same problem**: Sectile's built-in commands (`/stop`, `/plugins`), third-party admin commands, claim plugins, and chat formatters all need to ask `player.hasPermission("some.node")` without hardcoding a specific permissions plugin!
+
+Sectile builds cross-plugin capability discovery directly into `Kernel`:
+- **Providers register implementations via their `PluginScope`**: `scope.services()` (`ServiceRegistry`).
+- **Any server module or plugin queries active providers globally**: `Kernel.services` (`ServiceCatalog`).
+
+Because `ServiceRegistry` lives inside `PluginScope`, **when the plugin providing a service disables or reloads, Sectile automatically unregisters its provider and falls back to the next highest-priority provider cleanly.**
+
+---
+
+## Real Built-in Example: `PermissionService` (`:engine:api`)
+
+Out of the box, Sectile includes `dev.sectile.engine.api.permission.PermissionService` in `:engine:api`:
+
+```kotlin
+package dev.sectile.engine.api.permission
+
+import dev.sectile.engine.api.command.CommandSender
+
+interface PermissionService {
+    fun hasPermission(sender: CommandSender, permission: String): Boolean
+}
+```
+
+How does Sectile wire this?
+- Inside `engine:internal`, `InternalPlayer.hasPermission(permission)` checks `Kernel.services[PermissionService::class.java]` dynamically on each check.
+- If **no** permission plugin is installed yet, it falls back cleanly to `CommandSender`'s default behavior.
+- The moment you install a permissions plugin that registers an implementation of `PermissionService`, **every** command and plugin across the server automatically honors your permissions system!
+
+### Implementing `PermissionService` in a Plugin
+
+```kotlin
+import dev.sectile.engine.api.command.CommandSender
+import dev.sectile.engine.api.permission.PermissionService
+import dev.sectile.kernel.plugin.spi.lifecycle.BasePluginLifecycle
+import dev.sectile.kernel.service.register
+import dev.sectile.sdk.extension.scope
+import dev.sectile.sdk.extension.services
+import dev.sectile.sdk.plugin.annotation.Plugin
+
+@Plugin(id = "simple-perms", version = "1.0.0")
+class SimplePermsPlugin : BasePluginLifecycle() {
+
+    private val admins = setOf("Admin", "Console")
+
+    override fun enable() {
+        val provider = object : PermissionService {
+            override fun hasPermission(sender: CommandSender, permission: String): Boolean {
+                if (sender.name in admins) return true
+                return checkNodeInStorage(sender.uuid, permission)
+            }
+        }
+
+        // Registers into Kernel.services via our PluginScope with priority 100.
+        // Unregistered automatically when SimplePermsPlugin disables or reloads!
+        scope.services().register<PermissionService>(
+            provider = provider,
+            priority = 100,
+        )
+    }
+
+    private fun checkNodeInStorage(uuid: java.util.UUID, permission: String): Boolean = false
+}
+```
+
+*(Note: `register(...)` returns a `ServiceRegistration<T>` implementing `AutoCloseable` if you ever want to call `.unregister()` manually before disable.)*
+
+---
+
+## Defining & Providing Custom Services
+
+To let multiple plugins collaborate (for example, an `EconomyService` shared between a bank plugin and a shops plugin):
+
+1. **Put the interface in a shared API JAR or lightweight API plugin** (remember Chapter 03: both provider and consumer must load the *same* `EconomyService` `Class<?>` identity via dependency ClassLoader sharing).
+
+```kotlin
+package com.example.economy.api
+
+import java.util.UUID
+
+interface EconomyService {
+    fun balance(playerId: UUID): Double
+    fun withdraw(playerId: UUID, amount: Double): Boolean
+    fun deposit(playerId: UUID, amount: Double): Boolean
+}
+```
+
+2. **Register an implementation in your provider plugin (`scope.services()`):**
+
+```kotlin
+val reg = scope.services().register(
+    type = EconomyService::class.java,
+    provider = PostgresEconomyProvider(database),
+    priority = 50,
+)
+```
+
+### Priority Resolution & Fallback
+
+What happens if two plugins register `EconomyService`?
+- `DefaultServiceRegistry` maintains each service contract's registrations sorted in **descending order of `priority`** (`Int`, default `0`).
+- `Kernel.services.get<EconomyService>()` always returns the provider with the **highest `priority`**.
+- `Kernel.services.all<EconomyService>()` returns all active providers sorted from highest priority to lowest.
+- `Kernel.services.contains<EconomyService>()` checks whether at least one provider is active.
+- If the plugin holding `priority = 100` unloads or reloads, `Kernel.services.get()` seamlessly returns the next provider (e.g., `priority = 50`) with zero downtime!
+
+---
+
+## CRITICAL RULE: Never Cache Service References
+
+Whenever a consumer plugin calls a service owned by *another* plugin, follow this rule strictly:
+
+> **Always look up the service through `Kernel.services.get<T>()` when you need it — NEVER store the returned provider object in a class property or singleton field.**
+
+### What Goes Wrong If You Cache It?
+
+```kotlin
+// BAD: Caching the provider instance in a field!
+class ShopService {
+    // Pins the old EconomyPlugin ClassLoader in memory AND keeps calling the dead instance after reload!
+    private val economy = Kernel.services.get<EconomyService>()
+
+    fun buySword(player: Player) {
+        economy?.withdraw(player.uuid, 100.0)
+    }
+}
+```
+
+1. **ClassLoader Memory Leak**: If you hold a strong field reference to `PostgresEconomyProvider` inside `ShopService`, your plugin keeps `PostgresEconomyProvider.class` -> `PluginClassLoader("economy-plugin")` pinned in JVM Metaspace even after `"economy-plugin"` unloads!
+2. **Stale Dead State**: When the economy plugin reloads (`/plugins reload economy`), a brand-new `PostgresEconomyProvider` is created and registered — while your cached field continues calling the *old, closed* provider (whose database pool was already shut down!).
+3. **Why `WeakReference` Is NOT a Solution**: Wrapping the provider in `WeakReference<EconomyService>` stops pinning the classloader, *but* it still calls the dead provider until the JVM Garbage Collector happens to run, and once cleared it returns `null` forever instead of fetching the newly reloaded provider!
+
+### The Right Way (`Kernel.services.get<T>()`)
+
+`DefaultServiceRegistry` stores immutable `@Volatile` lists inside a `ConcurrentHashMap`. Calling `Kernel.services.get<T>()` per operation is wait-free, nanosecond-fast, and always returns the live active provider:
+
+```kotlin
+// GOOD: Look up fresh via Kernel.services at point of use!
+import dev.sectile.kernel.Kernel
+import dev.sectile.kernel.service.get
+
+class ShopService {
+    fun buySword(player: Player): Boolean {
+        val economy = Kernel.services.get<EconomyService>()
+            ?: error("No EconomyService is currently active.")
+        return economy.withdraw(player.uuid, 100.0)
+    }
+}
+```
+
+---
+
+**Next Step:** With events and cross-plugin services mastered, let's build player-facing commands, rich formatted chat, and multi-world interactions in [**Chapter 09 — Commands, Rich Chat & Worlds**](/03-building-gameplay/09-commands-chat-and-worlds/).

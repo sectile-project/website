@@ -1,0 +1,176 @@
+---
+title: "Chapter 10 — Concurrency & Schedulers"
+description: "Chapter 10 — Concurrency & Schedulers - part of the Sectile developer documentation."
+---
+
+In Chapter 01, we noted how confusing older game server schedulers can be when a single method tries to cover both wall-clock async I/O and fixed-tick simulation without telling you which thread runs your task or what unit a delay uses.
+
+Sectile replaces guesswork with **five explicit, self-cleaning concurrency primitives** — each designed for a specific workload and wired automatically into your **`PluginScope`**.
+
+---
+
+## Decision Guide: Which Tool Should I Use?
+
+| Workload | Sectile Primitive | Threads Used | Cleanup Guarantee |
+| :--- | :--- | :--- | :--- |
+| **Blocking I/O** (SQL queries, HTTP calls, Redis, file I/O) | `scope.virtualThreads()` | JVM Virtual Threads (`plugin-<id>-sectile-virtual-*`) | `shutdownNow()` on plugin unload |
+| **Heavy CPU calculations** (map generation, pathfinding, compression) | `scope.threadPool(threads, name)` | Bounded Daemon Platform Threads | `shutdownNow()` on plugin unload |
+| **Wall-clock delays & timers** ("in 5 seconds", "every 500ms") | `scope.scheduler()` (`RealtimeScheduler`) | Dedicated timer dispatching onto Virtual Threads | `shutdown(true)` on plugin unload |
+| **Deterministic game ticks** ("after 100 simulation ticks", independent of real lag) | `Kernel.schedulerProvider.createTickDriven(...)` | Executed explicitly when your tick loop calls `tick()` | `shutdown(true)` on plugin unload |
+| **Per-player network timers / packets** ("run on this player's Netty loop") | `player.connection.execute` / `schedule` / `scheduleAtFixedRate` | That connection's serialized Netty `EventLoop` | Auto-cancelled on player disconnect **and** plugin unload |
+
+Every primitive above **automatically propagates your `PluginClassLoader` as Thread Context ClassLoader (`TCCL`)** and cleanly strips it when the task ends.
+
+---
+
+## 1. Blocking I/O With Virtual Threads (`scope.virtualThreads()`)
+
+Never run database queries, HTTP webhook calls, or file reads on Netty connection threads or tick loops. Instead, submit blocking I/O to `scope.virtualThreads()`:
+
+```kotlin
+import dev.sectile.kernel.logger.logger
+import dev.sectile.sdk.extension.scope
+import dev.sectile.sdk.extension.virtualThreads
+import java.util.concurrent.CompletableFuture
+
+fun fetchPlayerRankAsync(username: String): CompletableFuture<String> {
+    return CompletableFuture.supplyAsync({
+        // Runs on a lightweight virtual thread; safe to block on JDBC/HTTP!
+        database.queryRank(username)
+    }, scope.virtualThreads()).whenComplete { _, error ->
+        if (error != null) {
+            logger().error("Rank lookup failed for $username", error)
+        }
+    }
+}
+```
+
+---
+
+## 2. Bounded CPU Compute (`scope.threadPool`)
+
+Virtual threads shine at waiting on I/O, *not* at running dozens of CPU-bound math loops concurrently (which can saturate JVM carrier threads). For CPU-heavy workloads, allocate a bounded platform thread pool with `scope.threadPool`:
+
+```kotlin
+import dev.sectile.sdk.extension.scope
+import dev.sectile.sdk.extension.threadPool
+
+override fun enable() {
+    val noisePool = scope.threadPool(
+        threads = 4,
+        name = "chunk-noise",
+    )
+
+    noisePool.submit {
+        generateTerrainRegion()
+    }
+}
+```
+
+Threads are automatically named (`plugin-<id>-chunk-noise-0`...), marked as daemons, TCCL-wrapped via `ScopedExecutorService`, and terminated on unload via `shutdownNow()`.
+
+---
+
+## 3. Wall-Clock Scheduling (`scope.scheduler()`)
+
+When you want an action timed by real-world clocks (`Duration`, precision `1ms`), acquire your scoped `RealtimeScheduler` via `scope.scheduler()`:
+
+```kotlin
+import dev.sectile.kernel.scheduler.after
+import dev.sectile.kernel.scheduler.every
+import dev.sectile.sdk.extension.scheduler
+import dev.sectile.sdk.extension.scope
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+
+override fun enable() {
+    val scheduler = scope.scheduler()
+
+    // One-shot after 5 seconds (returns a cancellable Task):
+    val announcementTask = scheduler.after(5.seconds) {
+        logger().info("Server warmup complete!")
+    }
+
+    // Fixed-rate interval starting after 2s, running every 500ms:
+    val heartbeat = scheduler.every(interval = 500.milliseconds, startingIn = 2.seconds) {
+        logger().debug("Periodic check running on virtual thread")
+    }
+
+    // Fixed-delay *between* end of previous run and next start:
+    val syncLoop = scheduler.scheduleWithDelay(
+        initialDelay = 10.seconds,
+        delayBetweenExecute = 30.seconds,
+        task = { flushMetricsToDisk() },
+    )
+
+    // Cancel any task early whenever needed:
+    // heartbeat.cancel()
+}
+```
+
+Exceptions inside tasks are logged safely by `RealtimeScheduler` so a single failure doesn't silently break subsequent exception reporting, and `InterruptedException` during plugin reload exits cleanly.
+
+---
+
+## 4. Deterministic Tick Scheduling (`TickDrivenScheduler` & `Ticks`)
+
+If your game mode simulates discrete logic ticks (for example, 20 TPS = `50ms` per tick), wall-clock timers drift whenever a tick takes slightly longer or shorter. Using `TickDrivenScheduler` and `Ticks` decouples **how many ticks** pass from **how many milliseconds** each tick represents:
+
+```kotlin
+import dev.sectile.kernel.Kernel
+import dev.sectile.kernel.scheduler.tick.Ticks
+import dev.sectile.kernel.scheduler.tick.toTicks
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+
+val tickDuration = 50.milliseconds
+val gameScheduler = Kernel.schedulerProvider.createTickDriven(
+    initialTick = Ticks.ZERO,
+    tickDuration = tickDuration,
+)
+
+// Schedule exact tick delays (independent of CPU jitter!):
+val exactTask = gameScheduler.runAfterDelay(
+    task = { spawnWave() },
+    delay = Ticks(100), // or convert cleanly: 5.seconds.toTicks(tickDuration)
+)
+
+// Advance simulation cleanly from your game loop:
+gameScheduler.tick()
+```
+
+Note that `createTickDriven(...)` also accepts standard `Duration` overloads (`after`, `every`) and **automatically hooks its `shutdown(cancelPendingTasks = true)` to your `PluginScope`**.
+
+---
+
+## 5. Per-Connection Netty Event-Loop Tasks (`PlayerConnection`)
+
+When a timed callback strictly belongs to one player's connection lifecycle (e.g., idle checks, sending timed packets, or resuming a login hook), schedule directly on `player.connection`:
+
+```kotlin
+import java.time.Duration
+
+val keepAliveCheck = connection.scheduleAtFixedRate(
+    initialDelay = Duration.ofSeconds(5),
+    period = Duration.ofSeconds(5),
+) {
+    // Runs directly on this connection's Netty EventLoop!
+    if (connection.isOnline()) {
+        connection.sendPacket(myStatusPacket)
+    }
+}
+
+val oneShot = connection.schedule(Duration.ofSeconds(10)) {
+    connection.disconnect("Timed out waiting for response")
+}
+```
+
+### Dual-Lifetime Cleanup (Zero Heap Bloat)
+
+Whenever you call `connection.schedule`, `connection.scheduleAtFixedRate`, or `connection.onDisconnect` from plugin code:
+- **If the player disconnects first**: the task cancels and **immediately detaches its `AutoCloseable` handle from `PluginScope`** so thousands of finished player sessions never accumulate dead closures in memory.
+- **If your plugin reloads first**: `PluginScope` immediately cancels the Netty `ScheduledFuture` (and unhooks disconnect listeners) so dead plugin callbacks never fire on still-connected players!
+
+---
+
+**Next Step:** You now master plugins, events, services, commands, chat, worlds, and concurrency. In **Part 4**, let's look beneath the gameplay surface into [**Chapter 11 — Login & Connection Stages**](/04-networking-and-protocol/11-login-and-connection-stages/).

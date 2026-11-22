@@ -1,0 +1,250 @@
+---
+title: "Chapter 05 — PluginScope & Memory Safety"
+description: "Chapter 05 — PluginScope & Memory Safety - part of the Sectile developer documentation."
+---
+
+Now that you know how to structure a plugin and run `load()` / `enable()` / `disable()`, let's cover the single most important architectural feature of Sectile for everyday stability: **`PluginScope`**.
+
+---
+
+## Why Does `PluginScope` Exist? (The Hot-Reload Problem)
+
+In older plugin platforms (like Spigot/Bukkit), running `/reload` is famous for breaking servers or crashing the JVM with `OutOfMemoryError: Metaspace`.
+
+Why? Because in traditional APIs, **registries don't track ownership cleanly**:
+- You register an event listener, three commands, two repeating timers, and a database pool during `onEnable()`.
+- When the plugin reloads, if your `onDisable()` misses even **one** `unregister()`, **one** timer thread, or **one** static reference, that dead listener keeps your old classes pinned in memory forever while the server spawns a duplicate copy of your plugin alongside it.
+
+Sectile eliminates framework-level reload bugs by making **`PluginScope` mandatory**. You do not manually track every single listener, command, world, service, or scheduler task you register — **your `PluginScope` owns them all**, and automatically shuts everything down the moment your plugin disables or reloads.
+
+---
+
+## The Basics: Acquiring & Using `PluginScope`
+
+Inside any `BasePluginLifecycle` (or `PluginLifecycle`) class, import `dev.sectile.sdk.extension.scope` and use `this.scope`:
+
+```kotlin
+import dev.sectile.kernel.plugin.spi.lifecycle.BasePluginLifecycle
+import dev.sectile.sdk.extension.eventbus
+import dev.sectile.sdk.extension.scheduler
+import dev.sectile.sdk.extension.scope
+import dev.sectile.sdk.plugin.annotation.Plugin
+
+@Plugin(id = "scoped-example", version = "1.0.0")
+class ScopedExamplePlugin : BasePluginLifecycle() {
+
+    override fun enable() {
+        // Every capability acquired via `scope` is bound to this plugin's lifecycle:
+        val bus = scope.eventbus()
+        val scheduler = scope.scheduler()
+
+        // You don't need to manually unsubscribe or shut down `scheduler` in disable()!
+    }
+}
+```
+
+If a helper class deep inside your plugin needs the current scope, acquire it via `Kernel`:
+
+```kotlin
+import dev.sectile.kernel.Kernel
+
+// Uses the current Thread Context ClassLoader (when executing inside a plugin callback):
+val currentScope = Kernel.pluginScopeFactory.acquire()
+
+// Or safer across arbitrary threads: inspects `this.javaClass.classLoader` explicitly!
+val ownerScope = Kernel.pluginScopeFactory.acquire(this)
+```
+
+---
+
+## Everything `scope` Gives You (Quick Reference)
+
+All extensions live in `dev.sectile.sdk.extension`:
+
+| Call | What It Provides | Automatic Cleanup on Disable/Reload |
+| :--- | :--- | :--- |
+| `scope.eventbus()` | Subscribe `@Listener` or lambda handlers | Unsubscribes all listeners registered via this scope |
+| `scope.commands()` | Register commands, subcommands & tab-completers | Unregisters all commands & generated completer keys |
+| `scope.services()` | Expose shared service implementations (Economy, Perms, etc.) | Unregisters all active providers registered by this plugin |
+| `scope.worlds()` | Register custom `World` instances | Unregisters custom worlds cleanly |
+| `scope.packetHandlers()` | Listen to inbound gameplay Hytale packets | Removes all packet handlers cleanly |
+| `scope.stageHooks()` | Intercept connection login/handshake steps | Removes all login stage hooks cleanly |
+| `scope.scheduler()` | Wall-clock delayed/periodic task scheduler (`RealtimeScheduler`) | Calls `shutdown(cancelPendingTasks = true)` |
+| `scope.virtualThreads()` | Virtual-thread `ExecutorService` for blocking I/O | Calls `shutdownNow()` |
+| `scope.threadPool(n, name)` | Bounded platform daemon thread pool for CPU compute | Calls `shutdownNow()` |
+| `scope.scan { ... }` | Discover & inject listeners/commands automatically | Delegates to scoped registries above |
+| `scope.loggerSpy()` | Observe log lines across the server | Removes registered spy loggers on unload |
+| `scope.onClose { ... }` | Custom teardown callback (or `scope.onClose(autoCloseable)`) | Executes in reverse (LIFO) order when scope closes |
+
+---
+
+## Wrapping Third-Party Libraries With `scope.onClose`
+
+Sectile's registries automatically track events, commands, services, and threads — **but Sectile cannot automatically know about external libraries** like HikariCP SQL pools, Redis clients, OkHttp clients, or Discord webhooks.
+
+Whenever you allocate an external client that holds sockets, file handles, or daemon threads, register its cleanup with **`scope.onClose`** immediately after creating it:
+
+```kotlin
+import com.zaxxer.hikari.HikariConfig
+import com.zaxxer.hikari.HikariDataSource
+import dev.sectile.kernel.plugin.spi.lifecycle.BasePluginLifecycle
+import dev.sectile.sdk.extension.scope
+
+class DatabasePlugin : BasePluginLifecycle() {
+
+    private lateinit var dataSource: HikariDataSource
+
+    override fun enable() {
+        val ds = HikariDataSource(HikariConfig().apply {
+            jdbcUrl = "jdbc:postgresql://localhost:5432/sectile"
+            username = "sectile"
+            password = "secret"
+        })
+
+        // Register cleanup right here so reload closes all DB connections cleanly!
+        scope.onClose(ds)
+        this.dataSource = ds
+    }
+}
+```
+
+### Real Example From Sectile (`DiscordHookPlugin`)
+
+Look at `example-plugins/discord-hook/.../DiscordHookPlugin.kt`:
+
+```kotlin
+override fun enable() {
+    DiscordWebHook.init()
+    scope.onClose { DiscordWebHook.shutdown() }
+    val config = loadDiscordConfig()
+    Kernel.loggerSpy.register(DiscordLogger(config))
+}
+```
+
+When you run `/plugins reload discordhook`, `scope` closes `DiscordWebHook` and removes `DiscordLogger` cleanly with zero lingering background tasks.
+
+### Advanced Pattern: Removable `AutoCloseable` Handles
+
+Wait — what if you use `scope.onClose` for something **temporary** that finishes **before** the plugin reloads (for example, a 30-second minigame arena or a per-request file handle)?
+
+`scope.onClose` returns an **`AutoCloseable` handle**:
+- Calling `handle.close()` **detaches the hook from `PluginScope` without running it twice**, so thousands of short-lived tasks over weeks of server uptime never pile up in memory.
+- If the plugin reloads *before* your work finishes normally, `PluginScope` still runs it automatically!
+
+```kotlin
+fun openTemporarySession(id: String) {
+    val resource = TempSessionResource(id)
+    val closeHandle = scope.onClose { resource.release() }
+
+    resource.whenFinished {
+        closeHandle.close() // Remove entry from scope immediately!
+        resource.release()
+    }
+}
+```
+
+---
+
+## Testing Your Plugin With `/plugins reload`
+
+Because Sectile stages plugin JARs cleanly (Chapter 03), your live development loop is effortless:
+1. Build your updated plugin JAR and drop it into `/plugins/`.
+2. Run **`/plugins reload <your-plugin-id>`** in the server console (or `/plugins reload` to rescan every plugin on disk).
+3. Sectile disables your plugin (and any dependents), closes its `PluginScope` and `PluginClassLoader`, copies the updated JAR, enables the fresh build, and re-enables dependents.
+
+Other useful built-in commands (`alias: /pl`):
+- `/plugins list` — Shows loaded plugins, versions, and lifecycle states.
+- `/plugins disable <id>` — Cleanly disables a plugin and tears down its scope.
+- `/plugins enable <id>` — Loads and enables a disabled plugin.
+
+---
+
+## Going Deeper: How JVM Memory Leaks Work & How to Avoid Them
+
+Why do developers still need to understand memory leaks even when `PluginScope` exists?
+
+### The JVM Retention Chain
+
+In Java and Kotlin, **every object instance holds a reference to its `Class<?>`, and every `Class<?>` holds a reference to the `PluginClassLoader` that loaded it**, which in turn holds **every class and static field in your entire plugin**:
+
+```text
+Live Thread / Global Map / Other Plugin Field (GC Root)
+  └──► 1 leaked object from your plugin
+         └──► YourClass.class
+                └──► PluginClassLoader ("my-plugin")
+                       └──► ALL classes, companion objects & @Bootstrap libs!
+```
+
+Even a **single** escaped reference keeps 100% of your unloaded plugin's classes stuck in JVM Metaspace across reloads!
+
+### How Sectile Protects You Internally
+
+Inside `KernelPluginScope` and `PluginClassLoader`, Sectile guards against four subtle framework leaks:
+1. **`ProtectedLazyProvider`**: Scoped registries (`EventBus`, `CommandRegistry`, `ServiceRegistry`, `Scheduler`, etc.) cannot be overwritten or deleted via `scope.put(...)` / `scope.remove(...)`, and lazy resources like `Scheduler` are not even allocated unless requested.
+2. **Anti-Resurrection Guard**: The moment `PluginClassLoader.close()` sets `isClosed = true`, any asynchronous thread calling `Kernel.pluginScopeFactory.acquire()` is rejected with `IllegalStateException` (including a post-insert double check) so zombie scopes can never be recreated mid-teardown.
+3. **Removable `CloseEntry` Handles (`LinkedHashSet`)**: `NettyPlayerConnection.schedule`, `onDisconnect`, `Kernel.addStopTask`, `RealtimeScheduler`, and `ScopedExecutorService` all automatically detach their scope handles the instant their work finishes cleanly.
+4. **Thread Context ClassLoader (TCCL) Binding & Reset**: `ScopedExecutorService`, `RealtimeScheduler`, `ScopedEventBusProvider`, `ScopedCommandRegistryProvider`, `ScopedPacketHandlerProvider`, and `ScopedStageHookProvider` temporarily bind your `PluginClassLoader` as TCCL while executing your code and restore the previous TCCL in `finally` — ensuring shared server threads never hold your `PluginClassLoader` idle in `Thread.contextClassLoader`.
+
+### The 5 Traps That Still Leak If You Write Them Yourself
+
+Because Sectile cannot police every reference inside your own objects, avoid these five anti-patterns:
+
+#### Trap 1: Caching Another Plugin's Service Instance
+```kotlin
+// BAD: Holds a strong reference to Plugin A's implementation across Plugin A reloads!
+class ShopManager {
+    private val economy = Kernel.services.get<EconomyService>() // LEAKS Plugin A's ClassLoader!
+}
+
+// GOOD: Query Kernel.services when needed (covered in depth in Chapter 08).
+class ShopManager {
+    fun charge(player: Player, amount: Double) {
+        val economy = Kernel.services.get<EconomyService>() ?: return
+        economy.withdraw(player.uuid, amount)
+    }
+}
+```
+*(Notice why `WeakReference<EconomyService>` is also a bad workaround: after Plugin A reloads, your `WeakReference` still hits the old unloaded instance until GC collects it, and then silently turns `null` instead of switching to Plugin A's newly loaded provider!)*
+
+#### Trap 2: Spawning Raw Threads or Unmanaged Pools
+```kotlin
+// BAD: Thread stays alive (and inherits TCCL!) after reload
+private val pool = Executors.newFixedThreadPool(4)
+
+// GOOD: Scoped executors shut down automatically on reload
+val io = scope.virtualThreads()
+val cpu = scope.threadPool(4, "my-workers")
+```
+
+#### Trap 3: Leaving External Clients Unclosed
+```kotlin
+// BAD: Sockets & Netty/OkHttp daemon threads survive unload
+val http = HttpClient.newHttpClient()
+
+// GOOD: Bind closing directly to scope
+val http = HttpClient.newHttpClient()
+scope.onClose { http.close() }
+```
+
+#### Trap 4: Storing Plugin-Private Classes Inside `PlayerConnection` Attributes
+`PlayerConnection` survives across a `/plugins reload` if the player stays logged in. If you call `connection.setAttribute(myKey, MyPluginCustomData(...))`:
+- Your custom `MyPluginCustomData` instance pins your old `PluginClassLoader` on that player connection until they disconnect!
+- Worse, after reload your new code creates a new `MyPluginCustomData.class` -> stale state or `ClassCastException`.
+
+```kotlin
+// GOOD Option A: Keep per-plugin player maps inside your plugin and clear them on unload:
+private val sessions = ConcurrentHashMap<UUID, PlayerSessionData>()
+override fun enable() {
+    scope.onClose { sessions.clear() }
+}
+
+// GOOD Option B: If using ConnectionKey<T>, clean it up in scope.onClose across Engine.players.all(),
+// or store only standard JDK types (String, UUID, Long).
+```
+
+#### Trap 5: Registering Raw JVM Shutdown Hooks
+Never call `Runtime.getRuntime().addShutdownHook(...)` from a plugin — that attaches your plugin's lambda to a JVM-wide root that never clears until the whole server process exits! If you genuinely need process-shutdown cleanup *while still cleaning up cleanly on plugin reload*, use `Kernel.addStopTask { ... }`, which automatically detaches itself via `PluginScope` if your plugin unloads first.
+
+---
+
+**Next Step:** Now that your plugin is safe from reload bugs and memory leaks, let's remove registration boilerplate using [**Chapter 06 — Package Scanner & Dependency Injection**](/02-plugin-fundamentals/06-package-scanner-and-di/).

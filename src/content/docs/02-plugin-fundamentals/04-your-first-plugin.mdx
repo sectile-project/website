@@ -1,0 +1,223 @@
+---
+title: "Chapter 04 — Your First Plugin"
+description: "Chapter 04 — Your First Plugin - part of the Sectile developer documentation."
+---
+
+In Part 1, you saw why Sectile keeps a strict boundary between public contracts and server internals, and why it includes an SDK on top of the API. Now let's build your first plugin step by step: project setup, plugin metadata, runtime library loading (`@Bootstrap`), logging, and YAML/JSON configuration.
+
+---
+
+## Step 1: Project Setup (`build.gradle.kts`)
+
+A Sectile plugin compiles **only** against the public API modules (`compileOnly`) because the server already provides them on `publicClassLoader` at runtime.
+
+You also apply the Gradle metadata plugin (`dev.sectile.plugin-metadata`), which automatically scans your `@Plugin` and `@Bootstrap` annotations at compile time and generates the plugin descriptor inside your JAR:
+
+```kotlin
+plugins {
+    kotlin("jvm")
+    id("dev.sectile.plugin-metadata")
+}
+
+dependencies {
+    compileOnly("dev.sectile:kernel-api:<version>")
+    compileOnly("dev.sectile:engine-api:<version>")
+    compileOnly("dev.sectile:engine-chat:<version>")
+    compileOnly("dev.sectile:networking-api:<version>")
+    compileOnly("dev.sectile:networking-protocol:<version>")
+    compileOnly("dev.sectile:sdk-common:<version>")
+    compileOnly("dev.sectile:gradle-extension-shared:<version>")
+}
+```
+
+> **Building inside the Sectile monorepo:** If your plugin lives inside this repository (like `example-plugins/debug`), replace external coordinates with `compileOnly(project(":kernel:api"))`, `compileOnly(project(":sdk:common"))`, etc., and apply `id("sectile.module")`.
+
+### Why No Hand-Written `manifest.json` or `plugin.yml`?
+
+In traditional servers, forgetting to update `plugin.yml` or duplicating your `Main` class path, version, and dependency map across JSON and code causes constant build friction. Sectile eliminates manual descriptor files completely: **`@Plugin` in your source code is the single source of truth**, and the Gradle extension compiles the descriptor for you.
+
+---
+
+## Step 2: Your Plugin Entry Class (`@Plugin` & `BasePluginLifecycle`)
+
+Create a class extending `BasePluginLifecycle` and annotate it with `@Plugin`:
+
+```kotlin
+package com.example.welcome
+
+import dev.sectile.kernel.logger.logger
+import dev.sectile.kernel.plugin.spi.lifecycle.BasePluginLifecycle
+import dev.sectile.sdk.plugin.annotation.Dependency
+import dev.sectile.sdk.plugin.annotation.Plugin
+
+@Plugin(
+    id = "welcome-plugin",
+    version = "1.0.0",
+    description = "Greets joining players with configurable messages.",
+    authors = ["YourName"],
+    dependencies = [
+        // Hard requirements (PluginStartup fails if missing):
+        // Dependency(id = "economy-api", version = "1.0.0"),
+    ],
+    softDependencies = [
+        // Optional integrations (loads after target if present; cascades on reload):
+        // Dependency(id = "discordhook"),
+    ],
+)
+class WelcomePlugin : BasePluginLifecycle() {
+
+    override fun load() {
+        logger().info("WelcomePlugin is loading...")
+    }
+
+    override fun enable() {
+        logger().info("WelcomePlugin is now enabled!")
+    }
+
+    override fun disable() {
+        logger().info("WelcomePlugin disabled.")
+    }
+}
+```
+
+### Understanding Versions (`Version` & `ReleaseChannel`)
+
+Sectile parses plugin versions semantically (`major.minor.patch` plus an optional release channel):
+- Supported channels ordered from least to most stable: `PRE_RELEASE < ALPHA < BETA < RC < STABLE` (e.g., `"1.0.0-ALPHA"`, `"2.1.0-RC"`, or `"1.0.0"` which defaults to `STABLE`).
+- Your main `@Plugin` class must keep a no-argument constructor so the kernel can instantiate it inside your plugin's isolated `PluginClassLoader`.
+
+### When Do `load()`, `enable()`, and `disable()` Run?
+
+1. **`load()`**: Runs right after `@Bootstrap` downloads external libraries and your `PluginClassLoader` instantiates the plugin. Use it for early non-gameplay setup (like preparing a service interface before dependents enable).
+2. **`enable()`**: Runs after required dependencies are enabled. Here you register listeners, commands, services, packet handlers, and schedulers through `scope`.
+3. **`disable()`**: Runs during shutdown or `/plugins reload` (after dependents disable). Immediately after `disable()`, Sectile closes your `PluginScope` and automatically cleans up everything you registered with it!
+
+---
+
+## Step 3: Downloading External Libraries (`@Bootstrap`)
+
+Suppose your plugin needs an external library like `commons-lang3`, a database driver (`HikariCP`, `postgresql`), or an HTTP client. If you shade all third-party JARs directly into your plugin JAR, builds become huge and duplicate dependencies across plugins.
+
+Sectile provides a dedicated **pre-load bootstrap phase** (`@Bootstrap` + `PluginBoostrap`):
+
+```kotlin
+package com.example.welcome
+
+import dev.sectile.kernel.logger.logger
+import dev.sectile.kernel.plugin.library.LibrariesRequest
+import dev.sectile.kernel.plugin.library.Repository
+import dev.sectile.kernel.plugin.spi.lifecycle.PluginBoostrap
+import dev.sectile.sdk.plugin.annotation.Bootstrap
+
+@Bootstrap
+class WelcomeBootstrap : PluginBoostrap {
+
+    override fun boot(libraries: LibrariesRequest) {
+        logger().info("Requesting runtime libraries...")
+
+        libraries.apply {
+            repository(Repository.MAVEN_CENTRAL)
+            // Custom repository if needed:
+            // repository("https://repo.example.com/releases/")
+
+            dependency("org.apache.commons:commons-lang3:3.20.0")
+            // Or explicit named form:
+            // dependency(group = "org.apache.commons", artifact = "commons-lang3", version = "3.20.0")
+        }
+    }
+}
+```
+
+> **Note on exact interface spelling:** The interface is spelled `PluginBoostrap` (`dev.sectile.kernel.plugin.spi.lifecycle.PluginBoostrap`).
+
+### Why `@Bootstrap` Is Isolated
+
+Under the hood, Sectile instantiates `WelcomeBootstrap` inside a **short-lived temporary ClassLoader** *before* loading `WelcomePlugin`. Once `boot(libraries)` finishes:
+1. That temporary bootstrap ClassLoader closes immediately.
+2. `PluginLibraryResolver` downloads/caches the requested Maven dependencies in `Kernel.libraryDirectory`.
+3. Your runtime `PluginClassLoader` mounts both your staged plugin JAR and those resolved JARs before `WelcomePlugin.load()` ever runs.
+
+Remember to declare those libraries as `compileOnly` in `build.gradle.kts` so you don't bundle them twice!
+
+---
+
+## Step 4: Logging (`logger()` & `LoggerSpy`)
+
+Remember from Chapter 01 that Sectile can initialize independent plugins in parallel using virtual threads without corrupting console output? That works because Sectile routes all logs through an asynchronous ring-buffer logger.
+
+Inside **any** class in your plugin, import `dev.sectile.kernel.logger.logger` and call `logger()`:
+
+```kotlin
+import dev.sectile.kernel.logger.logger
+
+class GreetingService {
+    private val log = logger()
+
+    fun greet(playerName: String) {
+        log.info("Greeting $playerName")
+        log.warn("Missing custom prefix for $playerName, using default")
+        log.debug("Extended trace info (enabled only when debug logging is on)")
+    }
+}
+```
+
+*(You can also pass a class explicitly with `GreetingService::class.logger()` or `logger<GreetingService>()`.)*
+
+If your plugin wants to **mirror or forward logs** from the server (like `example-plugins/discord-hook` sending warnings/errors to a webhook), implement `Logger` and register it with `scope.loggerSpy().register(myForwarder)` — it will automatically unsubscribe when your plugin reloads.
+
+---
+
+## Step 5: Configuration Files (`ConfigServiceRegistry` & `ConfigSection`)
+
+Instead of forcing every plugin author to write their own `FileManager` or include Jackson/SnakeYAML dependencies, Sectile's SDK includes built-in **`yaml`** and **`json`** config services via `ConfigServiceRegistry`.
+
+*(Why YAML by default? Just like across the broader server ecosystem, YAML is concise, supports comments/readable structure, and is familiar to server administrators — while JSON remains available whenever machine-generated configs fit better.)*
+
+### Loading a Config With Defaults
+
+1. Create `src/main/resources/config.yaml` in your plugin project:
+
+```yaml
+welcome-message: "Welcome to Sectile, %player%!"
+max-greetings-per-join: 1
+example-duration: "20s"
+database:
+  host: "localhost"
+  port: 5432
+```
+
+2. Load it in Kotlin using `ConfigServiceRegistry["yaml"]`:
+
+```kotlin
+package com.example.welcome.config
+
+import dev.sectile.kernel.config.ConfigSection
+import dev.sectile.kernel.config.ConfigServiceRegistry
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
+
+fun loadWelcomeConfig(): WelcomeConfig {
+    // Copies bundled resource "config.yaml" if missing on disk, then parses it
+    val section = ConfigServiceRegistry["yaml"].createIfAbsentAndLoad("config")
+    return WelcomeConfig(section)
+}
+
+class WelcomeConfig(section: ConfigSection) {
+    val welcomeMessage: String = section.getString("welcome-message", "Welcome to Sectile!")
+    val maxGreetings: Int = section.getInt("max-greetings-per-join", 1)
+    val exampleDuration: Duration = section.getDuration("example-duration", 20.seconds)
+
+    private val dbSection: ConfigSection = section.getSection("database")
+    val dbHost: String = dbSection.getString("host", "localhost")
+    val dbPort: Int = dbSection.getInt("port", 5432)
+}
+```
+
+Useful `ConfigService` helpers:
+- `createIfAbsentAndLoad("config", Path.of("plugins/welcome-plugin"))` — Writes into a specific plugin folder instead of the server root.
+- `createIfAbsentAndLoadToFile("defaults/config", Path.of("plugins/welcome-plugin/custom.yaml"))` — Separates the bundled resource path from the target file name.
+- `service.save(path, section)` — Persists mutated `ConfigSection` keys back to disk.
+
+---
+
+**Next Step:** Now that you have a working plugin skeleton, let's understand Sectile's most important runtime concept — [**Chapter 05 — `PluginScope` & Memory Safety**](/02-plugin-fundamentals/05-plugin-scopes-and-memory-safety/) — before you start registering listeners, commands, or threads.
